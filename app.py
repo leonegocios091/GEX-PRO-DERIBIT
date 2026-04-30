@@ -48,15 +48,19 @@ if st.sidebar.button("Atualizar Dashboard"):
         df_filt = df_opcoes[(df_opcoes['strike'] > preco_spot - margem) & 
                            (df_opcoes['strike'] < preco_spot + margem)].copy()
 
-        # BLINDAGEM CONTRA ERROS: Converte colunas para números e preenche vazios com 0
-        df_filt['gamma'] = pd.to_numeric(df_filt['gamma'], errors='coerce').fillna(0)
-        df_filt['open_interest'] = pd.to_numeric(df_filt['open_interest'], errors='coerce').fillna(0)
+        # BLINDAGEM TOTAL: Verifica se as colunas existem, se não, cria com zero
+        for col em ['gamma', 'open_interest']:
+            if col not in df_filt.columns:
+                df_filt[col] = 0
+            else:
+                df_filt[col] = pd.to_numeric(df_filt[col], errors='coerce').fillna(0)
 
         # Cálculo do GEX (Gamma Exposure)
-        # Se for Call (C): Gamma * OI * Preço
-        # Se for Put (P): -Gamma * OI * Preço
         def calcular_gex(row):
-            valor_gex = row['gamma'] * row['open_interest'] * preco_spot
+            # Garantimos que os valores sejam multiplicáveis
+            gamma = float(row.get('gamma', 0))
+            oi = float(row.get('open_interest', 0))
+            valor_gex = gamma * oi * preco_spot
             return valor_gex if row['tipo'] == 'C' else -valor_gex
 
         df_filt['gex_calculado'] = df_filt.apply(calcular_gex, axis=1)
