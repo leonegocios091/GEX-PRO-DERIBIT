@@ -101,7 +101,7 @@ if st.sidebar.button("Carregar Dados"):
     gex_final = df_filt.groupby('strike')['gex_calculado'].sum().reset_index()
     gex_final['cor'] = ['#00FF00' if x > 0 else '#FF0000' for x in gex_final['gex_calculado']]
 
-fig = go.Figure()
+    fig = go.Figure()
     fig.add_trace(go.Bar(
         x=gex_final['gex_calculado'],
         y=gex_final['strike'],
