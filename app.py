@@ -3,78 +3,110 @@ import pandas as pd
 import plotly.graph_objects as go
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="Deribit Export Monitor", layout="wide")
+st.set_page_config(page_title="GEX Pro - Deribit Analytics", layout="wide")
 
-def processar_csv_local(caminho_arquivo):
-    # Lendo o arquivo exportado da Deribit
-    df = pd.read_csv(caminho_arquivo)
+def carregar_e_limpar_dados(caminho):
+    # Lendo o CSV exportado
+    df = pd.read_csv(caminho)
     
-    # Extração de Strike e Tipo (Ex: BTC-30APR26-69000-C)
-    # O strike é o penúltimo elemento e o tipo (C/P) o último
+    # Extração de Strike e Tipo (C/P)
+    # Formato esperado: BTC-30APR26-69000-C
     df['strike'] = df['Instrument'].str.split('-').str[-2].astype(float)
     df['tipo'] = df['Instrument'].str.split('-').str[-1]
     
-    # Limpeza de dados (converte '-' ou nulos para 0)
-    for col in ['Open', 'Gamma', 'Δ|Delta']:
-        df[col] = pd.to_numeric(df[col].replace('-', '0'), errors='coerce').fillna(0.0)
-    
-    # Renomeando para facilitar o uso no código anterior
-    df = df.rename(columns={'Open': 'OI', 'Δ|Delta': 'Delta'})
-    
+    # Função para limpar strings e converter em número
+    def clean_num(valor):
+        if isinstance(valor, str):
+            valor = valor.replace('-', '0').replace('$', '').replace(',', '').strip()
+        try:
+            return float(valor)
+        except:
+            return 0.0
+
+    # Limpando as colunas críticas
+    colunas_limpar = ['Open', 'Gamma', 'Δ|Delta', 'Mark']
+    for col in colunas_limpar:
+        if col in df.columns:
+            df[col] = df[col].apply(clean_num)
+        else:
+            df[col] = 0.0
+
     return df
 
-# --- INTERFACE ---
-st.title("📈 Analisador de Exportação Deribit (BTC-30APR26)")
+# --- UI ---
+st.title("📊 Deribit Options Analytics: BTC-30APR26")
 
-# Simulação de "Tempo Real": O usuário pode subir o arquivo mais recente ou 
-# o script pode ler o arquivo salvo na mesma pasta do GitHub
 try:
-    file_path = 'BTC-30APR26-export.csv' # Nome exato do seu arquivo
-    df_raw = processar_csv_local(file_path)
+    # Lendo o arquivo local
+    file_path = 'BTC-30APR26-export.csv'
+    df_raw = carregar_e_limpar_dados(file_path)
     
-    # Menu de métricas
-    metrica = st.sidebar.radio("Selecione a Métrica", ["OI", "Gamma", "Delta"])
-    raio_pct = st.sidebar.slider("Zoom nos Strikes (%)", 5, 50, 20)
-    
-    # Preço de referência (Mark médio para estimar o Spot)
-    preco_ref = df_raw['Mark'].mean() * 100000 # Ajuste manual se necessário
-    # Como o CSV não tem o Spot exato, você pode definir um valor manual aqui:
-    spot_manual = st.sidebar.number_input("Ajuste o Preço Spot Atual", value=77000.0)
+    # Sidebar
+    metrica = st.sidebar.selectbox("Métrica Principal", ["OI (Open Interest)", "GEX (Gamma)", "DEX (Delta)"])
+    spot_manual = st.sidebar.number_input("Preço Spot (Referência)", value=float(df_raw['Mark'].max() * 1.1 if not df_raw.empty else 77000))
+    raio_pct = st.sidebar.slider("Raio de Strikes (%)", 5, 50, 20)
 
-    # Filtragem
+    # Cálculos de Exposição baseados no CSV[cite: 1]
+    # GEX = Gamma * Open * (Spot^2)
+    df_raw['GEX_calc'] = df_raw['Gamma'] * df_raw['Open'] * (spot_manual**2)
+    # DEX = Delta * Open * Spot
+    df_raw['DEX_calc'] = df_raw['Δ|Delta'] * df_raw['Open'] * spot_manual
+    
+    # Seleção da métrica para o gráfico
+    mapa_metrica = {
+        "OI (Open Interest)": "Open",
+        "GEX (Gamma)": "GEX_calc",
+        "DEX (Delta)": "DEX_calc"
+    }
+    col_plot = mapa_metrica[metrica]
+
+    # Filtro de Strikes
     margem = spot_manual * (raio_pct / 100)
     df_filt = df_raw[(df_raw['strike'] > spot_manual - margem) & 
                     (df_raw['strike'] < spot_manual + margem)].copy()
 
-    # Agrupamento para o gráfico de linhas
-    plot_data = df_filt.groupby(['strike', 'tipo'])[metrica].sum().unstack().fillna(0)
-    plot_data.columns = ['Calls', 'Puts']
+    # Preparação para Linhas e Áreas
+    plot_data = df_filt.groupby(['strike', 'tipo'])[col_plot].sum().unstack().fillna(0)
+    if 'C' not in plot_data.columns: plot_data['C'] = 0
+    if 'P' not in plot_data.columns: plot_data['P'] = 0
     plot_data = plot_data.reset_index()
 
-    # --- GRÁFICO DE LINHAS E ÁREAS ---
+    # --- GRÁFICO ---
     fig = go.Figure()
 
+    # Linha de Calls (Azul)
     fig.add_trace(go.Scatter(
-        x=plot_data['strike'], y=plot_data['Calls'],
+        x=plot_data['strike'], y=plot_data['C'],
         mode='lines', name='Calls', fill='tozeroy',
         line=dict(color='#2E64FE', width=3)
     ))
 
+    # Linha de Puts (Amarela)
     fig.add_trace(go.Scatter(
-        x=plot_data['strike'], y=plot_data['Puts'],
+        x=plot_data['strike'], y=plot_data['P'],
         mode='lines', name='Puts', fill='tozeroy',
         line=dict(color='#F4D03F', width=3)
     ))
 
-    fig.add_vline(x=spot_manual, line_dash="dash", line_color="red", annotation_text="SPOT")
+    # Linha do Spot
+    fig.add_vline(x=spot_manual, line_dash="dash", line_color="red", 
+                  annotation_text=f"SPOT: {spot_manual:,.0f}")
 
-    fig.update_layout(template="plotly_dark", height=600, hovermode="x unified",
-                      title=f"Distribuição de {metrica} - BTC 30-APR-26")
+    fig.update_layout(
+        template="plotly_dark", height=600,
+        title=f"Distribuição de {metrica} por Strike",
+        xaxis_title="Strike Price",
+        yaxis_title="Volume / Exposição",
+        hovermode="x unified"
+    )
 
     st.plotly_chart(fig, use_container_width=True)
-    
-    st.dataframe(df_filt[['Instrument', 'OI', 'Gamma', 'Delta']].head(10))
+
+    # Resumo métrico
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total OI", f"{df_filt['Open'].sum():,.0f}")
+    c2.metric("Net GEX", f"{df_filt['GEX_calc'].sum():,.2e}")
+    c3.metric("Net DEX", f"{df_filt['DEX_calc'].sum():,.2e}")
 
 except Exception as e:
-    st.error(f"Erro ao ler o arquivo CSV: {e}")
-    st.info("Certifique-se de que o arquivo 'BTC-30APR26-export.csv' está na mesma pasta do seu app.py no GitHub.")
+    st.error(f"Erro ao processar arquivo: {e}")
