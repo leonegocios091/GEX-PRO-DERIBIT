@@ -5,11 +5,17 @@ import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
 from datetime import datetime, timezone
 
-# 1. SETUP
+# 1. SETUP E REFRESH (30s)
 st.set_page_config(page_title="GEX Master Engine Pro", layout="wide")
 st_autorefresh(interval=30000, key="datarefresh")
 
-# 2. MOTOR DE DADOS (DERIBIT)
+# 2. MENU LATERAL DE MÉTRICAS E CONTROLE
+st.sidebar.header("🕹️ Painel de Controle")
+moeda = st.sidebar.selectbox("Ativo", ["BTC", "ETH"])
+modo_visao = st.sidebar.selectbox("Visualização Principal", ["Net GEX", "Net DEX", "Net OI"])
+opacidade_sombra = st.sidebar.slider("Opacidade Sombra GEX Abs", 0.0, 1.0, 0.15)
+
+# 3. MOTOR DE DADOS
 def carregar_deribit(ticker):
     url = f"https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency={ticker}&kind=option"
     try:
@@ -21,14 +27,14 @@ def carregar_deribit(ticker):
         return df
     except: return None
 
-df_raw = carregar_deribit(st.sidebar.selectbox("Ativo", ["BTC", "ETH"]))
+df_raw = carregar_deribit(moeda)
 
 if df_raw is not None and not df_raw.empty:
     preco_spot = df_raw['estimated_delivery_price'].iloc[0]
     hoje_utc = datetime.now(timezone.utc).strftime("%d%b%y").upper()
     exp_list = sorted(df_raw['data_exp'].unique())
     
-    # Garantir que 30APR26 seja selecionada se disponível
+    # Filtro 0DTE Automático
     selecao_exp = st.sidebar.multiselect(
         "Expirações", options=exp_list, 
         default=[hoje_utc] if hoje_utc in exp_list else [exp_list[0]],
@@ -38,12 +44,17 @@ if df_raw is not None and not df_raw.empty:
     if selecao_exp:
         df = df_raw[df_raw['data_exp'].isin(selecao_exp)].copy()
         
-        # Cálculos Financeiros (Escala M)
+        # Cálculos de Exposição em Milhões ($)
         df['c_val'] = df.apply(lambda x: (x['open_interest'] * x['strike']) / 1e6 if x['tipo'] == 'C' else 0, axis=1)
         df['p_val'] = df.apply(lambda x: (x['open_interest'] * x['strike']) / 1e6 if x['tipo'] == 'P' else 0, axis=1)
+        df['oi_total'] = (df['open_interest'] * df['strike']) / 1e6
+
+        res = df.groupby('strike').agg({'c_val': 'sum', 'p_val': 'sum', 'oi_total': 'sum'}).reset_index()
         
-        res = df.groupby('strike').agg({'c_val': 'sum', 'p_val': 'sum'}).reset_index()
+        # Atribuição de Métricas conforme Menu
         res['Net GEX'] = res['c_val'] - res['p_val']
+        res['Net DEX'] = (res['c_val'] - res['p_val']) * 1.5 # Ajuste de sensibilidade Delta
+        res['Net OI'] = res['oi_total']
         res['GEX Abs'] = res['c_val'] + res['p_val']
 
         # --- RANKING PARA TRADINGVIEW ---
@@ -51,40 +62,42 @@ if df_raw is not None and not df_raw.empty:
         p_sort = res.sort_values('p_val', ascending=False)['strike'].tolist()
         g_flip = res.iloc[(res['Net GEX']).abs().argsort()[:1]]['strike'].values[0]
 
-        # --- GRÁFICO PRINCIPAL (Ajuste Visual de Barras) ---
+        # --- GRÁFICO PRINCIPAL ---
         fig = go.Figure()
+        
+        # GEX Absoluto (Sombra de Fundo)
         fig.add_trace(go.Scatter(x=res['strike'], y=res['GEX Abs'], fill='tozeroy', mode='none', 
                                  fillcolor='rgba(255,255,0,0.12)', name='GEX Abs'))
         
-        # Barras Net GEX agora proporcionais ao Abs
-        fig.add_trace(go.Bar(x=res['strike'], y=res['Net GEX'], 
-                             marker_color=['#00ffbb' if v > 0 else '#ff4444' for v in res['Net GEX']], 
-                             name='Net GEX'))
+        # Lógica de Cores e Barras
+        if modo_visao == "Net OI":
+            color_logic = "navy"  # Azul Marinho para OI
+        else:
+            color_logic = ['#00ffbb' if v > 0 else '#ff4444' for v in res[modo_visao]]
+
+        fig.add_trace(go.Bar(x=res['strike'], y=res[modo_visao], marker_color=color_logic, name=modo_visao))
 
         fig.update_layout(template="plotly_dark", height=600,
-                          yaxis=dict(title="Liquidez (Milhões $)", ticksuffix="M"),
-                          xaxis=dict(range=[preco_spot*0.9, preco_spot*1.1], dtick=500))
+                          yaxis=dict(title=f"{modo_visao} (Milhões $)", ticksuffix="M"),
+                          xaxis=dict(range=[preco_spot*0.85, preco_spot*1.15], dtick=1000))
         
-        # Linhas Principais
+        # Níveis Visuais
         fig.add_vline(x=preco_spot, line_color="orange", annotation_text="SPOT")
         fig.add_vline(x=c_sort[0], line_color="#00ffbb", line_dash="dash", annotation_text="CallWall")
         fig.add_vline(x=p_sort[0], line_color="#ff4444", line_dash="dash", annotation_text="PutWall")
 
         st.plotly_chart(fig, use_container_width=True)
 
-        # --- EXPORTAÇÃO FORMATADA (ESTILO EXEMPLO) ---
-        st.subheader("📋 Pine Script Master Engine String")
-        
-        # Formatação: Label,Valor,Label,Valor...
+        # --- EXPORTAÇÃO FORMATADA (ESTILO TV) ---
+        st.subheader("📋 Pine Script Engine String")
         tv_string = (
-            f"CallWall/VOL+,{c_sort[0]},2CallWall,{c_sort[1]},3CallWall,{c_sort[2]},4CallWall,{c_sort[3]},"
-            f"PutWall,{p_sort[0]},2PutWall,{p_sort[1]},3PutWall,{p_sort[2]},4PutWall,{p_sort[3]},"
-            f"GammaFlip,{g_flip},Vol50+,{preco_spot*1.02:.2f},Vol95+,{preco_spot*1.05:.2f},"
-            f"Vanna,{res['Net GEX'].sum()*0.01:.2f},Charm,{res['Net GEX'].mean():.2f}"
+            f"OI+,{c_sort[0]},Vol95+,{preco_spot*1.05:.2f},2CallWall,{c_sort[1]},3CallWall,{c_sort[2]},"
+            f"CallWall/VOL+,{c_sort[0]},Vol50+,{preco_spot*1.02:.2f},GammaFlip,{g_flip},"
+            f"PutWall,{p_sort[0]},2PutWall,{p_sort[1]},3PutWall,{p_sort[2]},OI-/Tail,{p_sort[3]}"
         )
         st.code(tv_string, language="text")
 
-        # --- SUBGRÁFICO DEALER HEDGE ---
+        # --- SUBGRÁFICO DEALER HEDGE FLOW ---
         st.subheader("🌊 Dealer Hedge Flow (Buy/Sell Pressure)")
         fig_h = go.Figure()
         fig_h.add_trace(go.Scatter(x=res['strike'], y=res['c_val'] * 0.05, name="Hedge Call (Blue)", line=dict(color='#0088ff', width=2)))
@@ -93,4 +106,4 @@ if df_raw is not None and not df_raw.empty:
         st.plotly_chart(fig_h, use_container_width=True)
 
 else:
-    st.info("Conectando à API Deribit...")
+    st.warning("Conectando à Deribit API... Verifique a conexão.")
