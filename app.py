@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from streamlit_autorefresh import st_autorefresh
 from datetime import datetime, timezone
 
@@ -17,8 +18,8 @@ modo_visao = st.sidebar.selectbox("Métrica Principal", ["Net GEX", "Net DEX", "
 st.sidebar.divider()
 cor_gex_pos = st.sidebar.color_picker("GEX Positivo", "#00ffbb")
 cor_gex_neg = st.sidebar.color_picker("GEX Negativo", "#ff4444")
-cor_abs = st.sidebar.color_picker("Sombra GEX Abs (Fundo)", "#ffff00")
-opacidade_abs = st.sidebar.slider("Transparência do Fundo", 0.0, 1.0, 0.10)
+cor_abs = st.sidebar.color_picker("Sombra GEX Abs", "#ffff00")
+opacidade_abs = st.sidebar.slider("Transparência do Fundo", 0.0, 1.0, 0.12)
 
 # 3. MOTOR DE DADOS
 def carregar_deribit(ticker):
@@ -58,53 +59,50 @@ if df_raw is not None and not df_raw.empty:
         p_sort = res.sort_values('p_val', ascending=False)['strike'].tolist()
         g_flip = res.iloc[(res['Net GEX']).abs().argsort()[:1]]['strike'].values[0]
 
-        # --- GRÁFICO PRINCIPAL: FIX DE SOBREPOSIÇÃO ---
-        fig = go.Figure()
+        # --- GRÁFICO COM EIXO DUPLO PARA FORÇAR CAMADAS ---
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
         
-        # CAMADA 1 (FUNDO): GEX Absoluto
-        # Usamos Scatter com 'tozeroy' e explicitamente definimos a ordem de desenho
+        # 1. CAMADA DE FUNDO (Eixo Secundário)
         fig.add_trace(go.Scatter(
-            x=res['strike'], 
-            y=res['GEX Abs'], 
-            fill='tozeroy', 
-            mode='none', 
-            fillcolor=cor_abs,
-            opacity=opacidade_abs,
-            name='GEX Abs (Liquidez)',
-            legendrank=2 # Envia para trás na legenda também
-        ))
+            x=res['strike'], y=res['GEX Abs'], 
+            fill='tozeroy', mode='none', fillcolor=cor_abs,
+            opacity=opacidade_abs, name='GEX Abs (Fundo)'
+        ), secondary_y=True)
         
-        # CAMADA 2 (FRENTE): Barras GEX Net
+        # 2. CAMADA DA FRENTE (Eixo Primário)
         cores_barras = [cor_gex_pos if v > 0 else cor_gex_neg for v in res[modo_visao]]
         fig.add_trace(go.Bar(
-            x=res['strike'], 
-            y=res[modo_visao], 
-            marker=dict(color=cores_barras),
-            name=modo_visao,
-            legendrank=1 # Traz para frente na legenda
-        ))
+            x=res['strike'], y=res[modo_visao], 
+            marker_color=cores_barras, name=modo_visao
+        ), secondary_y=False)
 
+        # Ajuste de Layout
         fig.update_layout(
-            template="plotly_dark", 
-            height=600,
-            barmode='overlay', # Importante: mantém os eixos sobrepostos
+            template="plotly_dark", height=600,
             yaxis=dict(title=f"{modo_visao} (M$)", ticksuffix="M", gridcolor='rgba(255,255,255,0.05)'),
+            yaxis2=dict(visible=False), # Esconde o eixo da sombra para não confundir
             xaxis=dict(title="STRIKE", range=[preco_spot*0.9, preco_spot*1.1], dtick=500),
-            showlegend=True
+            showlegend=True,
+            margin=dict(l=20, r=20, t=20, b=20)
         )
         
-        # Níveis
-        fig.add_vline(x=preco_spot, line_color="orange", annotation_text="SPOT")
+        # --- LINHAS DE NÍVEIS ---
+        fig.add_vline(x=preco_spot, line_color="orange", line_width=2, annotation_text="SPOT")
         fig.add_vline(x=c_sort[0], line_color="#00ffbb", line_dash="dash", annotation_text="CWALL")
         fig.add_vline(x=p_sort[0], line_color="#ff4444", line_dash="dash", annotation_text="PWALL")
+        fig.add_vline(x=g_flip, line_color="white", line_dash="dot", line_width=2, annotation_text="G-FLIP") # Gamma Flip Corrigido
+
+        # Adicionando Níveis Secundários visualmente
+        fig.add_vline(x=c_sort[1], line_color="#00ffbb", line_dash="dot", opacity=0.5, annotation_text="2CW")
+        fig.add_vline(x=p_sort[1], line_color="#ff4444", line_dash="dot", opacity=0.5, annotation_text="2PW")
 
         st.plotly_chart(fig, use_container_width=True)
 
         # --- SUBGRÁFICO: HEDGE FLOW ---
-        st.subheader("🌊 Dealer Hedge Flow (Buy/Sell Pressure)")
+        st.subheader("🌊 Dealer Hedge Flow")
         fig_h = go.Figure()
-        fig_h.add_trace(go.Scatter(x=res['strike'], y=res['c_val'] * 0.05, name="Buy Pressure (Calls)", line=dict(color='#0088ff', width=3)))
-        fig_h.add_trace(go.Scatter(x=res['strike'], y=res['p_val'] * -0.05, name="Sell Pressure (Puts)", line=dict(color='#ff0000', width=3)))
+        fig_h.add_trace(go.Scatter(x=res['strike'], y=res['c_val'] * 0.05, name="Buy Pressure", line=dict(color='#0088ff', width=3)))
+        fig_h.add_trace(go.Scatter(x=res['strike'], y=res['p_val'] * -0.05, name="Sell Pressure", line=dict(color='#ff0000', width=3)))
         fig_h.update_layout(template="plotly_dark", height=250, yaxis=dict(ticksuffix="M"))
         st.plotly_chart(fig_h, use_container_width=True)
 
@@ -118,4 +116,4 @@ if df_raw is not None and not df_raw.empty:
         st.code(tv_string, language="text")
 
 else:
-    st.info("Aguardando dados da API Deribit...")
+    st.info("Conectando à Deribit...")
