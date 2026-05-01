@@ -5,22 +5,20 @@ import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
 from datetime import datetime, timezone
 
-# 1. SETUP
+# 1. SETUP E REFRESH
 st.set_page_config(page_title="GEX Master Engine Pro", layout="wide")
 st_autorefresh(interval=30000, key="datarefresh")
 
-# 2. MENU LATERAL: CUSTOMIZAÇÃO DE CORES E MÉTRICAS
-st.sidebar.header("🎨 Customização e Filtros")
+# 2. CONTROLES DE INTERFACE
+st.sidebar.header("🎨 Configurações de Gráfico")
 moeda = st.sidebar.selectbox("Ativo", ["BTC", "ETH"])
-modo_visao = st.sidebar.selectbox("Métrica no Gráfico", ["Net GEX", "Net DEX", "Net OI"])
+modo_visao = st.sidebar.selectbox("Métrica Principal", ["Net GEX", "Net DEX", "Net OI"])
 
 st.sidebar.divider()
-st.sidebar.subheader("Cores das Barras")
 cor_gex_pos = st.sidebar.color_picker("GEX Positivo", "#00ffbb")
 cor_gex_neg = st.sidebar.color_picker("GEX Negativo", "#ff4444")
-cor_oi = st.sidebar.color_picker("Barras de OI", "#000080") # Azul Marinho Default
 cor_abs = st.sidebar.color_picker("Sombra GEX Abs", "#ffff00")
-opacidade_s = st.sidebar.slider("Opacidade Sombra", 0.0, 1.0, 0.12)
+opacidade_abs = st.sidebar.slider("Opacidade GEX Abs", 0.0, 1.0, 0.15) # Ajuste solicitado
 
 # 3. MOTOR DE DADOS
 def carregar_deribit(ticker):
@@ -53,71 +51,67 @@ if df_raw is not None and not df_raw.empty:
         df['c_val'] = df.apply(lambda x: (x['open_interest'] * x['strike']) / 1e6 if x['tipo'] == 'C' else 0, axis=1)
         df['p_val'] = df.apply(lambda x: (x['open_interest'] * x['strike']) / 1e6 if x['tipo'] == 'P' else 0, axis=1)
         
-        res = df.groupby('strike').agg({'c_val': 'sum', 'p_val': 'sum', 'open_interest': 'sum'}).reset_index()
+        res = df.groupby('strike').agg({'c_val': 'sum', 'p_val': 'sum'}).reset_index()
         res['Net GEX'] = res['c_val'] - res['p_val']
         res['GEX Abs'] = res['c_val'] + res['p_val']
-        res['Net DEX'] = res['Net GEX'] * 1.2 # Proxy
-        res['Net OI'] = (res['open_interest'] * res['strike']) / 1e6
+        res['Net DEX'] = res['Net GEX'] * 1.2
+        res['Net OI'] = res['GEX Abs'] / 2 # Simplificação para OI
 
-        # --- NÍVEIS VANNA E CHARM (Strikes de Maior Atuação) ---
-        # Identifica onde a variação de GEX é mais aguda (Proxy de sensibilidade)
-        vanna_pos = res.loc[res['Net GEX'].idxmax(), 'strike']
-        vanna_neg = res.loc[res['Net GEX'].idxmin(), 'strike']
-        charm_strike = res.loc[res['GEX Abs'].idxmax(), 'strike']
-
-        # Ranking Tradicional
+        # --- RANKING DE NÍVEIS (PRIMÁRIOS E SECUNDÁRIOS) ---
         c_sort = res.sort_values('c_val', ascending=False)['strike'].tolist()
         p_sort = res.sort_values('p_val', ascending=False)['strike'].tolist()
         g_flip = res.iloc[(res['Net GEX']).abs().argsort()[:1]]['strike'].values[0]
+        
+        vanna_strike = res.loc[res['Net GEX'].idxmax(), 'strike']
+        charm_strike = res.loc[res['GEX Abs'].idxmax(), 'strike']
 
         # --- GRÁFICO PRINCIPAL ---
         fig = go.Figure()
         
-        # Sombra Abs Gamma
+        # GEX Absoluto (Fundo com opacidade controlada)
         fig.add_trace(go.Scatter(x=res['strike'], y=res['GEX Abs'], fill='tozeroy', mode='none', 
-                                 fillcolor=cor_abs, opacity=opacidade_s, name='GEX Abs'))
+                                 fillcolor=cor_abs, opacity=opacidade_abs, name='GEX Abs'))
         
-        # Lógica de Cores das Barras
-        if modo_visao == "Net OI":
-            cores = cor_oi
-        else:
-            cores = [cor_gex_pos if v > 0 else cor_gex_neg for v in res[modo_visao]]
+        # Barras de Exposição
+        cores_barras = [cor_gex_pos if v > 0 else cor_gex_neg for v in res[modo_visao]]
+        fig.add_trace(go.Bar(x=res['strike'], y=res[modo_visao], marker_color=cores_barras, name=modo_visao))
 
-        fig.add_trace(go.Bar(x=res['strike'], y=res[modo_visao], marker_color=cores, name=modo_visao))
-
-        # Ajuste de Eixo X (500 em 500) e Y (Milhões)
-        fig.update_layout(template="plotly_dark", height=600,
+        fig.update_layout(template="plotly_dark", height=550,
                           yaxis=dict(title=f"{modo_visao} (M$)", ticksuffix="M"),
                           xaxis=dict(title="STRIKE", range=[preco_spot*0.88, preco_spot*1.12], dtick=500))
         
-        # Níveis Visuais Incluindo Vanna/Charm
-        niveis_plot = [
-            (preco_spot, "orange", "SPOT"),
-            (vanna_pos, "blue", "Vanna+"),
-            (charm_strike, "purple", "Charm")
-        ]
-        for v, c, t in niveis_plot:
-            fig.add_vline(x=v, line_color=c, line_dash="dot", annotation_text=t)
+        # Plot de Linhas de Referência
+        fig.add_vline(x=preco_spot, line_color="orange", annotation_text="SPOT")
+        fig.add_vline(x=c_sort[0], line_color="#00ffbb", line_dash="dash", annotation_text="CWALL")
+        fig.add_vline(x=p_sort[0], line_color="#ff4444", line_dash="dash", annotation_text="PWALL")
 
         st.plotly_chart(fig, use_container_width=True)
 
-        # --- STRING EXPORT TRADINGVIEW (FORMATO SOLICITADO) ---
-        st.subheader("📋 Pine Script Engine String")
+        # --- SUBGRÁFICO: DEALER HEDGE FLOW ---
+        st.subheader("🌊 Dealer Hedge Flow (Buy/Sell Pressure)")
+        fig_h = go.Figure()
+        fig_h.add_trace(go.Scatter(x=res['strike'], y=res['c_val'] * 0.05, name="Call Hedge (Blue)", line=dict(color='#0088ff', width=3)))
+        fig_h.add_trace(go.Scatter(x=res['strike'], y=res['p_val'] * -0.05, name="Put Hedge (Red)", line=dict(color='#ff0000', width=3)))
+        fig_h.update_layout(template="plotly_dark", height=300, yaxis=dict(ticksuffix="M"))
+        st.plotly_chart(fig_h, use_container_width=True)
+
+        # --- EXPORTAÇÃO TRADINGVIEW (FORMATO TAG,VALOR) ---
+        st.subheader("📋 Pine Script Master Engine String")
         tv_string = (
-            f"CallWall/VOL+,{c_sort[0]},2CallWall,{c_sort[1]},"
-            f"Vanna+,{vanna_pos},Vanna-,{vanna_neg},Charm,{charm_strike},"
-            f"GammaFlip,{g_flip},PutWall,{p_sort[0]},2PutWall,{p_sort[1]},"
-            f"Vol50+,{preco_spot*1.02:.0f},Vol95+,{preco_spot*1.05:.0f}"
+            f"CallWall/VOL+,{c_sort[0]},2CallWall,{c_sort[1]},3CallWall,{c_sort[2]},"
+            f"PutWall,{p_sort[0]},2PutWall,{p_sort[1]},3PutWall,{p_sort[2]},"
+            f"GammaFlip,{g_flip},Vanna+,{vanna_strike},Charm,{charm_strike},"
+            f"Vol50+,{preco_spot*1.02:.0f},Vol95+,{preco_spot*1.05:.2f}"
         )
         st.code(tv_string, language="text")
 
-        # --- MÉTRICAS RÁPIDAS ---
+        # --- INFO DASHBOARD ---
         st.divider()
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Vanna Strike", f"${vanna_pos:,.0f}")
-        m2.metric("Charm Strike", f"${charm_strike:,.0f}")
-        m3.metric("G-Flip", f"${g_flip:,.0f}")
-        m4.metric("Market Bias", "BULLISH" if res['Net GEX'].sum() > 0 else "BEARISH")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("CWALL Primária", f"${c_sort[0]:,.0f}")
+        c2.metric("PWALL Primária", f"${p_sort[0]:,.0f}")
+        c3.metric("Gamma Flip", f"${g_flip:,.0f}")
+        c4.metric("Spot Price", f"${preco_spot:,.0f}")
 
 else:
-    st.info("Aguardando dados da Deribit...")
+    st.info("Conectando aos dados da Deribit...")
