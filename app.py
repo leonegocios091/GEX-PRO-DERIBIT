@@ -4,9 +4,8 @@ import requests
 import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
 from datetime import datetime, timezone
-import numpy as np
 
-# 1. SETUP
+# 1. SETUP & REFRESH
 st.set_page_config(page_title="GEX Master Engine Pro", layout="wide")
 st_autorefresh(interval=30000, key="datarefresh")
 
@@ -51,27 +50,28 @@ if df_raw is not None and not df_raw.empty:
         res['Net OI'] = (res['open_interest'] * res['strike']) / 1e6
         res['abs_gex'] = res['c_val'] + res['p_val']
 
-        # Cálculos de Níveis
+        # Lógica de Níveis (Ordenação para a String)
         c_sort = res.sort_values('c_val', ascending=False)['strike'].tolist()
         p_sort = res.sort_values('p_val', ascending=False)['strike'].tolist()
+        oi_sort = res.sort_values('open_interest', ascending=False)['strike'].tolist()
         g_flip = res.iloc[(res['Net GEX']).abs().argsort()[:1]]['strike'].values[0]
         
-        # Estimativa Simples de Vanna/Charm para Exportação (Baseada em concentração de Gamma/Time)
-        vanna_level = res.iloc[(res['abs_gex']).argsort()[-3:]]['strike'].mean() # Centro de Liquidez
-        charm_level = g_flip * 0.98 if preco_spot < g_flip else g_flip * 1.02 # Atração temporal
+        # Cálculos de Vol/Pain (Estimados para a string)
+        max_pain = res.iloc[(res['c_val'] + res['p_val']).argmin()]['strike']
+        compresso = (preco_spot + g_flip) / 2
 
         # --- GRÁFICO PRINCIPAL ---
         fig = go.Figure()
         
-        # 1. Abs GEX (Sombra AMARELA ao fundo)
+        # Abs GEX Amarelo (Fundo)
         fig.add_trace(go.Scatter(
             x=res['strike'], y=res['abs_gex'],
             fill='tozeroy', mode='none',
-            fillcolor=f'rgba(255, 255, 0, {opacidade_abs})', # AMARELO CONFIGURÁVEL
+            fillcolor=f'rgba(255, 255, 0, {opacidade_abs})',
             name='Abs GEX (Liquidez)'
         ))
         
-        # 2. Barras Dinâmicas (GEX, DEX ou OI)
+        # Barras Net
         cores = ['#00ffbb' if v > 0 else '#ff4444' for v in res[modo_visao]]
         fig.add_trace(go.Bar(
             x=res['strike'], y=res[modo_visao],
@@ -81,13 +81,13 @@ if df_raw is not None and not df_raw.empty:
         ))
 
         fig.update_layout(
-            template="plotly_dark", height=600,
-            yaxis=dict(title="M$", gridcolor='rgba(255,255,255,0.05)'),
+            template="plotly_dark", height=550,
+            yaxis=dict(title="Financeiro (M$)", gridcolor='rgba(255,255,255,0.05)'),
             xaxis=dict(title="STRIKE", range=[preco_spot*0.85, preco_spot*1.15], dtick=500),
             barmode='overlay'
         )
         
-        # Linhas Primárias
+        # Níveis Visuais
         fig.add_vline(x=preco_spot, line_color="orange", annotation_text="SPOT")
         fig.add_vline(x=c_sort[0], line_color="#00ffbb", line_dash="dash", annotation_text="CWALL")
         fig.add_vline(x=p_sort[0], line_color="#ff4444", line_dash="dash", annotation_text="PWALL")
@@ -95,25 +95,30 @@ if df_raw is not None and not df_raw.empty:
 
         st.plotly_chart(fig, use_container_width=True)
 
-        # --- HEDGE FLOW ---
-        st.subheader("🌊 Dealer Hedge Flow & Greeks Pressure")
+        # --- DEALER HEDGE FLOW (MODELO PRESSÃO CALL/PUT) ---
+        st.subheader("🌊 Dealer Hedge Flow (Call/Put Pressure)")
         fig_h = go.Figure()
-        fig_h.add_trace(go.Scatter(x=res['strike'], y=res['c_val']*0.03, name="Vanna (+)", line=dict(color='#ffff00', width=2)))
-        fig_h.add_trace(go.Scatter(x=res['strike'], y=res['p_val']*-0.03, name="Charm (-)", line=dict(color='#ff00ff', width=2)))
-        fig_h.update_layout(template="plotly_dark", height=200)
+        fig_h.add_trace(go.Scatter(x=res['strike'], y=res['c_val'] * 0.05, name="Call Pressure", line=dict(color='#0088ff', width=2)))
+        fig_h.add_trace(go.Scatter(x=res['strike'], y=res['p_val'] * -0.05, name="Put Pressure", line=dict(color='#ff4444', width=2)))
+        fig_h.update_layout(template="plotly_dark", height=200, margin=dict(t=10, b=10))
         st.plotly_chart(fig_h, use_container_width=True)
 
-        # --- STRING DE CÓPIA (VANNA & CHARM INCLUÍDOS) ---
+        # --- STRING DE CÓPIA TRADINGVIEW (MODELO SOLICITADO) ---
         st.divider()
-        st.subheader("📋 Pine Script Master String (Copy & Paste)")
+        st.subheader("📋 TradingView Master Engine String")
+        
+        # Construção exata conforme o modelo: OI+, Vol95+, 2CallWall, etc.
         tv_string = (
-            f"Spot,{preco_spot:.0f},GFlip,{g_flip:.0f},"
-            f"CW1,{c_sort[0]:.0f},CW2,{c_sort[1]:.0f},"
-            f"PW1,{p_sort[0]:.0f},PW2,{p_sort[1]:.0f},"
-            f"Vanna,{vanna_level:.0f},Charm,{charm_level:.0f}"
+            f"OI+,{oi_sort[0]},Vol95+,{preco_spot*1.05:.1f},"
+            f"2CallWall,{c_sort[1]},CallWall/VOL+,{c_sort[0]},"
+            f"Vol50+,{preco_spot*1.02:.1f},MaxPain/ExpPain,{max_pain},"
+            f"GammaFlip,{g_flip},PutWall,{p_sort[0]},"
+            f"2PutWall,{p_sort[1]},OI-/Tail,{oi_sort[-1]},"
+            f"Compressão,{compresso:.2f}"
         )
+        
         st.code(tv_string, language="text")
-        st.caption("Use estes valores para atualizar os níveis de suporte e magnetismo no seu indicador TradingView.")
+        st.caption("Copie a string acima para o seu indicador GEX & DEX Master Engine no TradingView.")
 
 else:
-    st.info("Conectando ao terminal de dados Deribit...")
+    st.info("Aguardando dados da Deribit...")
