@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import plotly.graph_objects as go
+import numpy as np
 from streamlit_autorefresh import st_autorefresh
 from datetime import datetime, timezone
 
@@ -9,12 +10,13 @@ from datetime import datetime, timezone
 st.set_page_config(page_title="GEX Master Engine Pro", layout="wide")
 st_autorefresh(interval=30000, key="datarefresh")
 
-# 2. CONTROLES
+# 2. CONTROLES DE INTERFACE
 st.sidebar.header("🕹️ Painel de Controle")
 moeda = st.sidebar.selectbox("Ativo", ["BTC", "ETH"])
+modo_visao = st.sidebar.radio("Métrica Principal", ["Net GEX", "Net DEX", "Net OI"])
 opacidade_sombra = st.sidebar.slider("Opacidade Sombra GEX Abs", 0.0, 1.0, 0.15)
 
-# 3. CARREGAMENTO
+# 3. MOTOR DE DADOS
 def carregar_deribit(ticker):
     url = f"https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency={ticker}&kind=option"
     try:
@@ -30,8 +32,6 @@ df_raw = carregar_deribit(moeda)
 
 if df_raw is not None and not df_raw.empty:
     preco_spot = df_raw['estimated_delivery_price'].iloc[0]
-    
-    # --- LOGICA 0DTE REAL (30APR26) ---
     hoje_utc = datetime.now(timezone.utc).strftime("%d%b%y").upper()
     exp_list = sorted(df_raw['data_exp'].unique())
     
@@ -44,86 +44,70 @@ if df_raw is not None and not df_raw.empty:
     if selecao_exp:
         df = df_raw[df_raw['data_exp'].isin(selecao_exp)].copy()
         
-        # Cálculos de Métricas (Escalonando para Milhões)
-        df['call_oi_usd'] = df.apply(lambda x: x['open_interest'] * x['strike'] if x['tipo'] == 'C' else 0, axis=1)
-        df['put_oi_usd'] = df.apply(lambda x: x['open_interest'] * x['strike'] if x['tipo'] == 'P' else 0, axis=1)
+        # Cálculos de OI (Em milhões para escala vertical correta)
+        df['call_oi_m'] = df.apply(lambda x: (x['open_interest'] * x['strike']) / 1e6 if x['tipo'] == 'C' else 0, axis=1)
+        df['put_oi_m'] = df.apply(lambda x: (x['open_interest'] * x['strike']) / 1e6 if x['tipo'] == 'P' else 0, axis=1)
         
-        # Dealer Hedge Flow (Estimado)
-        df['hedge_call'] = df['call_oi_usd'] * 0.05 # Proxy de Delta Hedging
-        df['hedge_put'] = df['put_oi_usd'] * -0.05
-
-        resumo = df.groupby('strike').agg({
-            'call_oi_usd': 'sum', 'put_oi_usd': 'sum',
-            'hedge_call': 'sum', 'hedge_put': 'sum'
-        }).reset_index()
-
-        resumo['gex_net'] = resumo['call_oi_usd'] - resumo['put_oi_usd']
-        resumo['gex_abs'] = resumo['call_oi_usd'] + resumo['put_oi_usd']
-
-        # Níveis
-        cwall = resumo.loc[resumo['call_oi_usd'].idxmax(), 'strike']
-        pwall = resumo.loc[resumo['put_oi_usd'].idxmax(), 'strike']
-        gflip = resumo.iloc[(resumo['gex_net']).abs().argsort()[:1]]['strike'].values[0]
+        resumo = df.groupby('strike').agg({'call_oi_m': 'sum', 'put_oi_m': 'sum'}).reset_index()
         
-        # AG1/AG2 (Top GEX Absoluto)
-        top_abs = resumo.sort_values(by='gex_abs', ascending=False)
-        ag1, ag2 = top_abs.iloc[0]['strike'], top_abs.iloc[1]['strike']
+        # Métricas de Visualização
+        resumo['Net GEX'] = (resumo['call_oi_m'] - resumo['put_oi_m']) * 0.1
+        resumo['Net DEX'] = resumo['call_oi_m'] - resumo['put_oi_m']
+        resumo['Net OI'] = (resumo['call_oi_m'] + resumo['put_oi_m']) / 2
+        resumo['GEX Abs'] = resumo['call_oi_m'] + resumo['put_oi_m']
 
-        # --- PLOTAGEM PRINCIPAL ---
+        # --- RANKING DE NÍVEIS (PARA TRADINGVIEW) ---
+        c_levels = resumo.sort_values('call_oi_m', ascending=False)['strike'].unique()
+        p_levels = resumo.sort_values('put_oi_m', ascending=False)['strike'].unique()
+        
+        # Pegando 4 níveis de cada lado
+        c_wall, c2, c3, c4 = c_levels[0], c_levels[1], c_levels[2], c_levels[3]
+        p_wall, p2, p3, p4 = p_levels[0], p_levels[1], p_levels[2], p_levels[3]
+        g_flip = resumo.iloc[(resumo['Net GEX']).abs().argsort()[:1]]['strike'].values[0]
+
+        # --- GRÁFICO PRINCIPAL ---
         fig = go.Figure()
-
-        # Sombra de Liquidez (GEX Abs) - Sempre no Fundo
-        fig.add_trace(go.Scatter(
-            x=resumo['strike'], y=resumo['gex_abs'], fill='tozeroy', 
-            mode='lines', line=dict(width=0), fillcolor=f'rgba(255, 255, 0, {opacidade_sombra})',
-            name='GEX Abs (Liquidez)'
-        ))
-
-        # Net GEX Bars
-        fig.add_trace(go.Bar(
-            x=resumo['strike'], y=resumo['gex_net'],
-            marker_color=['#00ffbb' if v > 0 else '#ff4444' for v in resumo['gex_net']],
-            name='Net GEX'
-        ))
-
-        fig.update_layout(
-            template="plotly_dark", height=500,
-            xaxis=dict(title="STRIKE", range=[preco_spot*0.9, preco_spot*1.1], dtick=500),
-            yaxis=dict(
-                title="GEX Exposure (Escala M/B)",
-                tickformat=".2s", # CORREÇÃO: Força 1M, 2M...
-                exponentformat="SI",
-                showgrid=True
-            )
-        )
+        fig.add_trace(go.Scatter(x=resumo['strike'], y=resumo['GEX Abs'], fill='tozeroy', mode='none', 
+                                 fillcolor=f'rgba(255,255,0,{opacidade_sombra})', name='GEX Abs'))
         
-        # Linhas de Nível
-        for v, c, t in [(preco_spot, "orange", "SPOT"), (cwall, "#00ffbb", "CWALL"), (pwall, "#ff4444", "PWALL")]:
+        y_data = resumo[modo_visao]
+        fig.add_trace(go.Bar(x=resumo['strike'], y=y_data, 
+                             marker_color=['#00ffbb' if v > 0 else '#ff4444' for v in y_data], name=modo_visao))
+
+        fig.update_layout(template="plotly_dark", height=500,
+                          yaxis=dict(title=f"{modo_visao} (Milhões $)", ticksuffix="M"),
+                          xaxis=dict(range=[preco_spot*0.9, preco_spot*1.1], dtick=500))
+        
+        for v, c, t in [(preco_spot, "orange", "SPOT"), (c_wall, "#00ffbb", "CWALL"), (p_wall, "#ff4444", "PWALL")]:
             fig.add_vline(x=v, line_color=c, line_dash="dash", annotation_text=t)
 
         st.plotly_chart(fig, use_container_width=True)
 
-        # --- SUBGRÁFICO: DEALER HEDGE FLOW ---
-        st.subheader("🌊 Dealer Hedge Flow (Buy/Sell Pressure)")
-        fig_hedge = go.Figure()
-        fig_hedge.add_trace(go.Scatter(x=resumo['strike'], y=resumo['hedge_call'], name="Call Hedge (Buy)", line=dict(color='#0088ff', width=3)))
-        fig_hedge.add_trace(go.Scatter(x=resumo['strike'], y=resumo['hedge_put'], name="Put Hedge (Sell)", line=dict(color='#ff0000', width=3)))
-        
-        fig_hedge.update_layout(
-            template="plotly_dark", height=300,
-            yaxis=dict(tickformat=".2s", title="Hedge Pressure"),
-            xaxis=dict(range=[preco_spot*0.9, preco_spot*1.1])
-        )
-        st.plotly_chart(fig_hedge, use_container_width=True)
+        # --- DEALER HEDGE FLOW (SUBGRÁFICO) ---
+        st.subheader("🌊 Dealer Hedge Flow & Premium")
+        fig_h = go.Figure()
+        fig_h.add_trace(go.Scatter(x=resumo['strike'], y=resumo['call_oi_m'] * 0.05, name="Call Hedge (Buy)", line=dict(color='#0088ff')))
+        fig_h.add_trace(go.Scatter(x=resumo['strike'], y=resumo['put_oi_m'] * -0.05, name="Put Hedge (Sell)", line=dict(color='#ff0000')))
+        fig_h.update_layout(template="plotly_dark", height=250, yaxis=dict(ticksuffix="M"))
+        st.plotly_chart(fig_h, use_container_width=True)
 
-        # --- PAINEL DE MÉTRICAS ---
+        # --- MÉTRICAS DE VOL E SENSIBILIDADE (SIMULADAS) ---
         st.divider()
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("SPOT", f"${preco_spot:,.0f}")
-        c2.metric("G-FLIP", f"${gflip:,.0f}")
-        c3.metric("AG1 (LQX)", f"${ag1:,.0f}")
-        c4.metric("AG2 (LQX)", f"${ag2:,.0f}")
+        col1, col2, col3, col4 = st.columns(4)
+        vol_50 = preco_spot * 0.02 # Exemplo
+        vanna_total = resumo['Net GEX'].sum() * 0.01
+        
+        col1.metric("Vol 50%", f"${vol_50:,.0f}")
+        col2.metric("Vanna", f"{vanna_total:.2f}M")
+        col3.metric("Charm", f"{(vanna_total/2):.2f}M")
+        col4.metric("PCR Total", f"{(resumo['put_oi_m'].sum()/resumo['call_oi_m'].sum()):.2f}")
 
-        # PINE SCRIPT STRING
-        st.subheader("📋 Pine Script Master Engine")
-        st.code(f"CWALL,{cwall},PWALL,{pwall},GFLIP,{gflip},AG1,{ag1},AG2,{ag2},SPOT,{preco_spot:.0f}", language="text")
+        # --- STRING EXPORT TRADINGVIEW ---
+        st.subheader("📋 Pine Script Master Engine String")
+        # Níveis primários e secundários para o código Pine
+        tv_string = (f"SPOT,{preco_spot:.0f},CWALL,{c_wall},C2,{c2},C3,{c3},PWALL,{p_wall},P2,{p2},P3,{p3},"
+                     f"GFLIP,{g_flip},VOL50,{vol_50:.0f},VANNA,{vanna_total:.1f}")
+        st.code(tv_string, language="text")
+
+else:
+    st.info("Aguardando dados da Deribit...")
