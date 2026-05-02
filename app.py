@@ -31,7 +31,6 @@ def carregar_deribit(ticker):
 
         df = pd.DataFrame(res)
 
-        # Proteção contra colunas ausentes
         required_cols = ['instrument_name', 'open_interest', 'mark_iv']
         for col in required_cols:
             if col not in df.columns:
@@ -43,8 +42,8 @@ def carregar_deribit(ticker):
         df['data_exp'] = parts.str[1]
         df['tipo'] = parts.str[3]
 
-        # Limpeza crítica
         df = df.dropna(subset=['strike'])
+
         df['open_interest'] = pd.to_numeric(df['open_interest'], errors='coerce').fillna(0)
 
         return df
@@ -53,59 +52,62 @@ def carregar_deribit(ticker):
         return None
 
 # =========================================
-# 4. GEX REAL (BLINDADO)
+# 4. EXPOSURES (GEX + VEX)
 # =========================================
-def calcular_gex_real(df, S):
+def calcular_exposures(df, S):
     df = df.copy()
 
-    # --- DATA ---
-    df['exp_datetime'] = pd.to_datetime(
-        df['data_exp'],
-        format='%d%b%y',
-        errors='coerce',
-        utc=True
-    )
-
+    df['exp_datetime'] = pd.to_datetime(df['data_exp'], format='%d%b%y', errors='coerce', utc=True)
     now = datetime.now(timezone.utc)
-    df['T'] = (df['exp_datetime'] - now).dt.total_seconds() / (365 * 24 * 3600)
+
+    df['T'] = (df['exp_datetime'] - now).dt.total_seconds() / (365*24*3600)
     df['T'] = df['T'].fillna(0).clip(lower=1e-6)
 
-    # --- IV ---
     df['iv'] = pd.to_numeric(df['mark_iv'], errors='coerce') / 100
-    df['iv'] = df['iv'].replace(0, np.nan)
-    df['iv'] = df['iv'].fillna(df['iv'].median())
-    df['iv'] = df['iv'].clip(lower=0.01)
+    df['iv'] = df['iv'].replace(0, np.nan).fillna(df['iv'].median()).clip(lower=0.01)
 
-    # --- STRIKE ---
-    K = df['strike'].replace(0, np.nan)
-    K = K.fillna(method='ffill')
-
+    K = df['strike']
     sigma = df['iv']
     T = df['T']
 
-    # --- d1 protegido ---
     with np.errstate(divide='ignore', invalid='ignore'):
-        d1 = (np.log(S / K) + (0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+        d1 = (np.log(S / K) + 0.5 * sigma**2 * T) / (sigma * np.sqrt(T))
+        d2 = d1 - sigma * np.sqrt(T)
 
     d1 = d1.replace([np.inf, -np.inf], 0).fillna(0)
+    d2 = d2.replace([np.inf, -np.inf], 0).fillna(0)
 
-    # --- gamma ---
-    gamma = normal_pdf(d1) / (S * sigma * np.sqrt(T))
-    gamma = gamma.replace([np.inf, -np.inf], 0).fillna(0)
+    pdf = normal_pdf(d1)
 
-    # --- GEX ---
+    gamma = pdf / (S * sigma * np.sqrt(T))
+    vanna = -pdf * d2 / sigma
+
     df['gex'] = gamma * df['open_interest'] * (S**2)
+    df['vex'] = vanna * df['open_interest'] * S
 
-    # Convenção dealer
-    df.loc[df['tipo'] == 'P', 'gex'] *= -1
+    df.loc[df['tipo'] == 'P', ['gex', 'vex']] *= -1
 
-    # Limpeza final
-    df['gex'] = df['gex'].replace([np.inf, -np.inf], 0).fillna(0)
+    df[['gex','vex']] = df[['gex','vex']].replace([np.inf, -np.inf], 0).fillna(0)
 
     return df
 
 # =========================================
-# 5. UI
+# 5. G-FLIP INTERPOLADO
+# =========================================
+def calcular_gflip_interpolado(res):
+    x = res['strike'].values
+    y = res['Net GEX'].values
+
+    for i in range(len(y) - 1):
+        if y[i] == 0:
+            return x[i]
+        if y[i] * y[i+1] < 0:
+            return x[i] - y[i] * (x[i+1] - x[i]) / (y[i+1] - y[i])
+
+    return None
+
+# =========================================
+# 6. UI
 # =========================================
 st.sidebar.header("🕹️ Real-Time Engine")
 moeda = st.sidebar.selectbox("Ativo", ["BTC", "ETH"])
@@ -114,7 +116,7 @@ opacidade_abs = st.sidebar.slider("Opacidade Abs GEX", 0.0, 1.0, 0.15)
 df_raw = carregar_deribit(moeda)
 
 # =========================================
-# 6. PROCESSAMENTO
+# 7. PROCESSAMENTO
 # =========================================
 if df_raw is not None and not df_raw.empty:
 
@@ -144,10 +146,11 @@ if df_raw is not None and not df_raw.empty:
             st.warning("Sem dados para os vencimentos selecionados.")
             st.stop()
 
-        df = calcular_gex_real(df, preco_spot)
+        df = calcular_exposures(df, preco_spot)
 
         res = df.groupby('strike').agg({
             'gex': 'sum',
+            'vex': 'sum',
             'open_interest': 'sum'
         }).reset_index()
 
@@ -158,15 +161,21 @@ if df_raw is not None and not df_raw.empty:
         res = res.sort_values('strike')
 
         res['Net GEX'] = res['gex'] / 1e9
+        res['Net VEX'] = res['vex'] / 1e9
         res['abs_gex'] = res['Net GEX'].abs()
         res['flow'] = res['Net GEX'].cumsum()
 
-        # --- G-FLIP ---
-        sign_change = np.where(np.sign(res['Net GEX']).diff() != 0)[0]
-        g_flip = res.iloc[sign_change[0]]['strike'] if len(sign_change) > 0 else None
+        g_flip = calcular_gflip_interpolado(res)
 
         # =========================================
-        # GRÁFICO
+        # TERM STRUCTURE
+        # =========================================
+        term = df.groupby('data_exp')['gex'].sum().reset_index()
+        term['gex'] = term['gex'] / 1e9
+        term = term.sort_values('data_exp')
+
+        # =========================================
+        # GRÁFICO GEX
         # =========================================
         fig = go.Figure()
 
@@ -175,7 +184,8 @@ if df_raw is not None and not df_raw.empty:
             y=res['abs_gex'],
             fill='tozeroy',
             mode='none',
-            fillcolor=f'rgba(255,255,0,{opacidade_abs})'
+            fillcolor=f'rgba(255,255,0,{opacidade_abs})',
+            name='Abs GEX'
         ))
 
         cores = ['#00ffbb' if v > 0 else '#ff4444' for v in res['Net GEX']]
@@ -183,37 +193,79 @@ if df_raw is not None and not df_raw.empty:
         fig.add_trace(go.Bar(
             x=res['strike'],
             y=res['Net GEX'],
-            marker_color=cores
+            marker_color=cores,
+            name='Net GEX'
         ))
 
-        fig.add_vline(x=preco_spot, line_color="orange")
+        fig.add_vline(x=preco_spot, line_color="orange",
+                      annotation_text=f"SPOT {preco_spot:.0f}")
 
         if g_flip:
-            fig.add_vline(x=g_flip, line_color="white", line_dash="dot")
+            fig.add_vline(x=g_flip, line_color="white",
+                          line_dash="dot", annotation_text="G-FLIP")
 
-        fig.update_layout(
-            template="plotly_dark",
-            height=500
-        )
+        fig.update_layout(template="plotly_dark", height=500)
 
         st.plotly_chart(fig, use_container_width=True)
 
         # =========================================
-        # FLOW
+        # DEALER FLOW
         # =========================================
+        st.subheader("🌊 Dealer Hedge Flow")
+
         fig_h = go.Figure()
 
         fig_h.add_trace(go.Scatter(
             x=res['strike'],
             y=res['flow'],
-            line=dict(color='#00d4ff', width=3)
+            line=dict(color='#00d4ff', width=3),
+            fill='tozeroy',
+            fillcolor='rgba(0,212,255,0.05)'
         ))
 
         fig_h.update_layout(template="plotly_dark", height=250)
 
         st.plotly_chart(fig_h, use_container_width=True)
 
-        st.caption(f"Atualizado {datetime.now().strftime('%H:%M:%S')} UTC")
+        # =========================================
+        # VEX
+        # =========================================
+        st.subheader("⚡ Vanna Exposure (VEX)")
+
+        fig_v = go.Figure()
+
+        fig_v.add_trace(go.Bar(
+            x=res['strike'],
+            y=res['Net VEX'],
+            marker_color=['#ffaa00' if v > 0 else '#8844ff' for v in res['Net VEX']]
+        ))
+
+        fig_v.update_layout(template="plotly_dark", height=250)
+
+        st.plotly_chart(fig_v, use_container_width=True)
+
+        # =========================================
+        # TERM STRUCTURE
+        # =========================================
+        st.subheader("⏳ Gamma Term Structure")
+
+        fig_t = go.Figure()
+
+        fig_t.add_trace(go.Bar(
+            x=term['data_exp'],
+            y=term['gex'],
+            marker_color=['#00ffbb' if v > 0 else '#ff4444' for v in term['gex']]
+        ))
+
+        fig_t.update_layout(template="plotly_dark", height=250)
+
+        st.plotly_chart(fig_t, use_container_width=True)
+
+        # =========================================
+        # FOOTER
+        # =========================================
+        st.divider()
+        st.caption(f"Dealer Gamma Engine | {datetime.now().strftime('%H:%M:%S')} UTC")
 
 else:
     st.info("Sincronizando com Deribit...")
