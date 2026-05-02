@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 # =========================================
 # CONFIG
 # =========================================
-st.set_page_config(page_title="GEX Safe Trading Engine", layout="wide")
+st.set_page_config(page_title="GEX Trading Engine", layout="wide")
 st_autorefresh(interval=20000, key="refresh")
 
 # =========================================
@@ -41,7 +41,7 @@ def load_data(ticker):
         return None
 
 # =========================================
-# EXPOSURE ENGINE
+# EXPOSURE
 # =========================================
 def calc_exposure(df, S):
     df = df.copy()
@@ -80,10 +80,7 @@ def calc_exposure(df, S):
 # PROFILE
 # =========================================
 def gamma_profile(df, spot_range):
-    out = []
-    for s in spot_range:
-        out.append(calc_exposure(df, s)['gex'].sum())
-    return np.array(out)/1e9
+    return np.array([calc_exposure(df, s)['gex'].sum() for s in spot_range]) / 1e9
 
 # =========================================
 # SCORE
@@ -114,24 +111,20 @@ def get_signal(score):
     return "NEUTRO"
 
 # =========================================
-# SIMULADOR DE TRADE
+# INICIALIZA HISTÓRICO
 # =========================================
-def simular_trade(signal, price):
+if "trades" not in st.session_state:
+    st.session_state["trades"] = []
 
-    if signal == "LONG":
-        return f"🟢 SIMULADO LONG @ {price:.2f}"
-
-    elif signal == "SHORT":
-        return f"🔴 SIMULADO SHORT @ {price:.2f}"
-
-    return "Sem trade"
+if "position" not in st.session_state:
+    st.session_state["position"] = None
 
 # =========================================
 # UI
 # =========================================
-st.sidebar.header("Configuração")
+st.sidebar.header("Config")
 ticker = st.sidebar.selectbox("Ativo", ["BTC","ETH"])
-auto_mode = st.sidebar.toggle("Auto Trade (Simulado)")
+auto = st.sidebar.toggle("Auto Trade (Simulado)")
 
 df_raw = load_data(ticker)
 
@@ -144,56 +137,63 @@ if df_raw is not None and not df_raw.empty:
 
     df = calc_exposure(df_raw, spot)
 
-    res = df.groupby('strike').agg({
-        'gex':'sum',
-        'vex':'sum',
-        'charm':'sum'
-    }).reset_index().sort_values('strike')
+    res = df.groupby('strike').agg({'gex':'sum','vex':'sum','charm':'sum'}).reset_index()
+    res = res.sort_values('strike')
 
     res['Net GEX'] = res['gex']/1e9
     res['Net VEX'] = res['vex']/1e9
     res['Net Charm'] = res['charm']/1e9
 
-    # PROFILE
     spot_range = np.linspace(spot*0.9, spot*1.1, 30)
     profile = gamma_profile(df_raw, spot_range)
 
-    # SCORE + SIGNAL
     score = calc_score(res, profile, spot_range)
     signal = get_signal(score)
 
-    # =========================================
-    # DASHBOARD
-    # =========================================
-    st.title("🧠 GEX Trading Engine (Modo Seguro)")
+    st.title("📊 GEX Engine com Histórico")
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Score", round(score,1))
     col2.metric("Sinal", signal)
     col3.metric("Preço", round(spot,2))
 
-    st.info("⚠️ Modo simulação ativo (sem execução real de ordens)")
+    # =========================================
+    # EXECUÇÃO SIMULADA
+    # =========================================
+    if auto:
 
-    # ALERTAS
-    if score > 70:
-        st.warning("🚀 Possível tendência de alta")
-    elif score < 30:
-        st.warning("🔻 Possível queda forte")
+        pos = st.session_state["position"]
+
+        # abre posição
+        if pos is None and signal in ["LONG","SHORT"]:
+            trade = {
+                "tipo": signal,
+                "entrada": spot,
+                "hora": datetime.now().strftime("%H:%M:%S")
+            }
+            st.session_state["position"] = trade
+            st.session_state["trades"].append(trade)
+
+        # fecha posição
+        elif pos is not None and signal != pos["tipo"] and signal != "NEUTRO":
+            pnl = (spot - pos["entrada"]) if pos["tipo"]=="LONG" else (pos["entrada"] - spot)
+            pos["saida"] = spot
+            pos["pnl"] = pnl
+            pos["hora_saida"] = datetime.now().strftime("%H:%M:%S")
+
+            st.session_state["position"] = None
 
     # =========================================
-    # CONTROLE DE TRADE
+    # MOSTRAR HISTÓRICO
     # =========================================
-    if "last_signal" not in st.session_state:
-        st.session_state["last_signal"] = None
+    st.subheader("📜 Histórico de Trades")
 
-    if auto_mode and signal != "NEUTRO":
+    trades_df = pd.DataFrame(st.session_state["trades"])
+    if not trades_df.empty:
+        st.dataframe(trades_df)
 
-        if signal != st.session_state["last_signal"]:
-            result = simular_trade(signal, spot)
-            st.session_state["last_signal"] = signal
-            st.success(result)
-        else:
-            st.info("Aguardando novo sinal...")
+        total_pnl = trades_df["pnl"].fillna(0).sum()
+        st.metric("PnL Total (simulado)", round(total_pnl,2))
 
     # =========================================
     # GRÁFICOS
@@ -201,14 +201,8 @@ if df_raw is not None and not df_raw.empty:
     fig = go.Figure()
     fig.add_trace(go.Bar(x=res['strike'], y=res['Net GEX']))
     fig.add_vline(x=spot)
-    fig.update_layout(template="plotly_dark", height=300)
+    fig.update_layout(template="plotly_dark")
     st.plotly_chart(fig, use_container_width=True)
 
-    fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(x=spot_range, y=profile))
-    fig2.add_vline(x=spot)
-    fig2.update_layout(template="plotly_dark", height=300)
-    st.plotly_chart(fig2, use_container_width=True)
-
 else:
-    st.info("Carregando dados...")
+    st.info("Carregando...")
