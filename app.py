@@ -4,136 +4,151 @@ import numpy as np
 import requests
 import plotly.graph_objects as go
 from datetime import datetime, timezone
+import os
 
 st.set_page_config(layout="wide")
 
-# =============================
-# DATA
-# =============================
-@st.cache_data(ttl=20)
-def load_data():
-    url = "https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option"
-    res = requests.get(url).json().get("result", [])
-    df = pd.DataFrame(res)
+FILE = "gex_surface.csv"
 
-    parts = df['instrument_name'].str.split('-')
-    df['strike'] = pd.to_numeric(parts.str[2], errors='coerce')
-    df['tipo'] = parts.str[3]
+# =========================
+# MATH
+# =========================
+def normal_pdf(x):
+    return np.exp(-0.5 * x**2) / np.sqrt(2*np.pi)
 
-    df['open_interest'] = pd.to_numeric(df['open_interest'], errors='coerce').fillna(0)
+# =========================
+# LOAD DATA
+# =========================
+@st.cache_data(ttl=15)
+def load_deribit():
+    try:
+        url = "https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option"
+        res = requests.get(url).json().get("result", [])
+        df = pd.DataFrame(res)
 
-    return df.dropna(subset=['strike'])
+        parts = df['instrument_name'].str.split('-')
+        df['strike'] = pd.to_numeric(parts.str[2], errors='coerce')
+        df['tipo'] = parts.str[3]
 
-# =============================
-# GEX SIMPLES (rápido)
-# =============================
-def calc_levels(df):
-    df['call_oi'] = np.where(df['tipo']=="C", df['open_interest'], 0)
-    df['put_oi'] = np.where(df['tipo']=="P", df['open_interest'], 0)
+        df['open_interest'] = pd.to_numeric(df['open_interest'], errors='coerce').fillna(0)
 
-    res = df.groupby('strike').agg({
-        'call_oi':'sum',
-        'put_oi':'sum'
-    }).reset_index()
+        return df.dropna(subset=['strike'])
+    except:
+        return None
 
-    res['net'] = res['call_oi'] - res['put_oi']
-    res['total'] = res['call_oi'] + res['put_oi']
+# =========================
+# CALC GEX POR STRIKE
+# =========================
+def calc_gex(df, S):
 
-    # níveis principais
-    call_wall = res.sort_values('call_oi', ascending=False).iloc[0]['strike']
-    put_wall = res.sort_values('put_oi', ascending=False).iloc[0]['strike']
-    max_pain = res.sort_values('total').iloc[0]['strike']
+    df = df.copy()
 
-    # gamma flip (aproximação)
-    res['cum'] = res['net'].cumsum()
-    flip = res.iloc[(res['cum']).abs().argsort()[:1]]['strike'].values[0]
+    df['iv'] = pd.to_numeric(df['mark_iv'], errors='coerce')/100
+    df['iv'] = df['iv'].replace(0, np.nan).fillna(0.5)
 
-    return res, call_wall, put_wall, max_pain, flip
+    K = df['strike']
+    sigma = df['iv']
+    T = 0.01
 
-# =============================
-# MAIN
-# =============================
-st.title("🔥 GEX Institutional Dashboard")
+    d1 = (np.log(S/K) + 0.5*sigma**2*T)/(sigma*np.sqrt(T))
+    pdf = normal_pdf(d1)
 
-df = load_data()
+    gamma = pdf/(S*sigma*np.sqrt(T))
 
-if df is not None and not df.empty:
+    df['gex'] = gamma * df['open_interest'] * S**2
 
-    price = df['estimated_delivery_price'].iloc[0]
+    df.loc[df['tipo']=="P", 'gex'] *= -1
 
-    res, call_wall, put_wall, max_pain, flip = calc_levels(df)
+    return df[['strike','gex']]
 
-    # =============================
-    # LAYOUT
-    # =============================
-    col1, col2 = st.columns([4,1])
+# =========================
+# SAVE SURFACE
+# =========================
+def save_surface(df, price):
 
-    # =============================
-    # GRÁFICO PRINCIPAL
-    # =============================
-    with col1:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-        fig = go.Figure()
+    df['time'] = now
+    df['price'] = price
 
-        fig.add_trace(go.Scatter(
-            x=res['strike'],
-            y=res['net'],
-            mode='lines',
-            name="Net Flow"
+    if os.path.exists(FILE):
+        old = pd.read_csv(FILE)
+        df = pd.concat([old, df], ignore_index=True)
+
+    df.to_csv(FILE, index=False)
+
+# =========================
+# LOAD HISTORY
+# =========================
+def load_surface():
+    if os.path.exists(FILE):
+        df = pd.read_csv(FILE)
+        df['time'] = pd.to_datetime(df['time'])
+        return df
+    return pd.DataFrame()
+
+# =========================
+# UI
+# =========================
+st.title("🔥 GEX HEATMAP INSTITUCIONAL")
+
+df_raw = load_deribit()
+
+if df_raw is not None and not df_raw.empty:
+
+    price = df_raw['estimated_delivery_price'].iloc[0]
+
+    gex_df = calc_gex(df_raw, price)
+
+    # botão coleta
+    if st.button("📥 Coletar Snapshot"):
+        save_surface(gex_df, price)
+        st.success("Snapshot salvo")
+
+    # auto coleta
+    if st.checkbox("Auto coletar"):
+        save_surface(gex_df, price)
+
+    st.metric("Preço", round(price,2))
+
+    # =========================
+    # LOAD HISTÓRICO
+    # =========================
+    hist = load_surface()
+
+    if not hist.empty:
+
+        st.subheader("📊 Heatmap GEX")
+
+        # pivot para heatmap
+        pivot = hist.pivot_table(
+            index='strike',
+            columns='time',
+            values='gex',
+            aggfunc='sum'
+        )
+
+        pivot = pivot.fillna(0)
+
+        fig = go.Figure(data=go.Heatmap(
+            z=pivot.values,
+            x=pivot.columns,
+            y=pivot.index,
+            colorscale='RdBu',
+            zmid=0
         ))
 
-        # linhas institucionais
-        fig.add_vline(x=price, line_color="white")
-        fig.add_vline(x=flip, line_color="yellow", line_dash="dash", annotation_text="Gamma Flip")
-        fig.add_vline(x=call_wall, line_color="green", annotation_text="Call Wall")
-        fig.add_vline(x=put_wall, line_color="red", annotation_text="Put Wall")
-
-        fig.update_layout(template="plotly_dark", height=500)
+        fig.update_layout(
+            template="plotly_dark",
+            height=600,
+            xaxis_title="Tempo",
+            yaxis_title="Strike"
+        )
 
         st.plotly_chart(fig, use_container_width=True)
 
-    # =============================
-    # PERFIL LATERAL
-    # =============================
-    with col2:
-
-        st.subheader("📊 Liquidity Map")
-
-        fig2 = go.Figure()
-
-        fig2.add_trace(go.Bar(
-            y=res['strike'],
-            x=res['call_oi'],
-            orientation='h',
-            name="Calls"
-        ))
-
-        fig2.add_trace(go.Bar(
-            y=res['strike'],
-            x=-res['put_oi'],
-            orientation='h',
-            name="Puts"
-        ))
-
-        fig2.update_layout(
-            template="plotly_dark",
-            height=500,
-            barmode='overlay'
-        )
-
-        st.plotly_chart(fig2, use_container_width=True)
-
-    # =============================
-    # NÍVEIS
-    # =============================
-    st.subheader("📌 Níveis Institucionais")
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    c1.metric("Preço", round(price,2))
-    c2.metric("Gamma Flip", flip)
-    c3.metric("Call Wall", call_wall)
-    c4.metric("Put Wall", put_wall)
+    else:
+        st.info("Sem histórico ainda. Clique em coletar.")
 
 else:
     st.warning("Erro ao carregar dados")
