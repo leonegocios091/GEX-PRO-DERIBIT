@@ -1,82 +1,75 @@
-st.subheader("🔥 GEX Heatmap (Pro)")
+# =========================
+# HEATMAP PROFISSIONAL (CORRIGIDO)
+# =========================
+if not hist.empty:
 
-# =========================
-# PREPARAÇÃO DOS DADOS
-# =========================
-pivot = hist.pivot_table(
-    index='strike',
-    columns='time',
-    values='gex',
-    aggfunc='sum'
-).fillna(0)
+    st.subheader("🔥 GEX Heatmap (Pro)")
 
-# ordena corretamente
-pivot = pivot.sort_index()
+    pivot = hist.pivot_table(
+        index='strike',
+        columns='time',
+        values='gex',
+        aggfunc='sum'
+    ).fillna(0)
 
-# =========================
-# FILTRO DE REGIÃO (ZOOM)
-# =========================
-spot = hist["price"].iloc[-1]
+    pivot = pivot.sort_index()
 
-range_min = spot * 0.9
-range_max = spot * 1.1
+    # pega preço atual com segurança
+    if "price" in hist.columns:
+        spot = hist["price"].iloc[-1]
+    else:
+        spot = pivot.index.mean()
 
-pivot = pivot[(pivot.index >= range_min) & (pivot.index <= range_max)]
+    # zoom região relevante
+    range_min = spot * 0.9
+    range_max = spot * 1.1
+    pivot = pivot[(pivot.index >= range_min) & (pivot.index <= range_max)]
 
-# =========================
-# SUAVIZAÇÃO (ANTI-RUÍDO)
-# =========================
-pivot_smooth = pivot.rolling(3, axis=0, min_periods=1).mean()
+    # proteção contra dataset pequeno
+    if pivot.shape[0] < 5 or pivot.shape[1] < 2:
+        st.warning("Poucos dados ainda para heatmap.")
+    else:
 
-# =========================
-# NORMALIZAÇÃO (CRUCIAL)
-# =========================
-z = pivot_smooth.values
+        # suavização
+        pivot_smooth = pivot.rolling(3, axis=0, min_periods=1).mean()
 
-max_abs = np.percentile(np.abs(z), 95)
-z = np.clip(z, -max_abs, max_abs)
+        z = pivot_smooth.values
 
-# =========================
-# HEATMAP
-# =========================
-fig = go.Figure(data=go.Heatmap(
-    z=z,
-    x=pivot_smooth.columns,
-    y=pivot_smooth.index,
-    colorscale=[
-        [0.0, "#8B0000"],   # vermelho escuro
-        [0.5, "#111111"],   # neutro
-        [1.0, "#00FFFF"]    # azul/ciano
-    ],
-    zmid=0,
-    colorbar=dict(title="GEX"),
-))
+        # normalização robusta
+        max_abs = np.percentile(np.abs(z), 95)
+        if max_abs == 0:
+            max_abs = 1
 
-# =========================
-# LINHA DE PREÇO
-# =========================
-fig.add_hline(
-    y=spot,
-    line_color="white",
-    line_width=2,
-    annotation_text="SPOT"
-)
+        z = np.clip(z, -max_abs, max_abs)
 
-# =========================
-# LAYOUT
-# =========================
-fig.update_layout(
-    template="plotly_dark",
-    height=650,
-    margin=dict(t=40, b=40),
-    xaxis=dict(
-        title="Tempo",
-        tickangle=45
-    ),
-    yaxis=dict(
-        title="Strike",
-        autorange="reversed"  # opcional (estilo bookmap)
-    )
-)
+        fig = go.Figure(data=go.Heatmap(
+            z=z,
+            x=pivot_smooth.columns,
+            y=pivot_smooth.index,
+            colorscale=[
+                [0.0, "#8B0000"],
+                [0.5, "#111111"],
+                [1.0, "#00FFFF"]
+            ],
+            zmid=0,
+            colorbar=dict(title="GEX"),
+        ))
 
-st.plotly_chart(fig, use_container_width=True)
+        fig.add_hline(
+            y=spot,
+            line_color="white",
+            line_width=2,
+            annotation_text="SPOT"
+        )
+
+        fig.update_layout(
+            template="plotly_dark",
+            height=650,
+            xaxis=dict(title="Tempo", tickangle=45),
+            yaxis=dict(title="Strike")
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+else:
+    st.info("Ainda sem histórico suficiente para heatmap.")
