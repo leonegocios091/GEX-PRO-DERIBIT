@@ -1,115 +1,195 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import requests
 import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
 from datetime import datetime, timezone
+from scipy.stats import norm
 
-# 1. SETUP & REFRESH (Taxa de atualização agressiva para simular tempo real)
+# =========================================
+# 1. SETUP
+# =========================================
 st.set_page_config(page_title="GEX Master Engine Pro", layout="wide")
 st_autorefresh(interval=15000, key="hiro_sync_refresh")
 
-# 2. MOTOR DE DADOS
+# =========================================
+# 2. DATA LOADER (COM CACHE)
+# =========================================
+@st.cache_data(ttl=10)
 def carregar_deribit(ticker):
     url = f"https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency={ticker}&kind=option"
     try:
         res = requests.get(url, timeout=10).json()['result']
         df = pd.DataFrame(res)
+
         parts = df['instrument_name'].str.split('-')
         df['strike'] = parts.str[2].astype(float)
         df['data_exp'] = parts.str[1]
         df['tipo'] = parts.str[3]
-        return df
-    except Exception: return None
 
-# 3. INTERFACE LATERAL
+        return df
+    except:
+        return None
+
+# =========================================
+# 3. BLACK-SCHOLES GEX
+# =========================================
+def calcular_gex_real(df, S):
+    df = df.copy()
+
+    # Tempo até expiração
+    df['exp_datetime'] = pd.to_datetime(df['data_exp'], format='%d%b%y', utc=True)
+    now = datetime.now(timezone.utc)
+    df['T'] = (df['exp_datetime'] - now).dt.total_seconds() / (365 * 24 * 3600)
+    df['T'] = df['T'].clip(lower=1e-6)
+
+    # Volatilidade implícita
+    df['iv'] = df['mark_iv'] / 100
+    df['iv'] = df['iv'].clip(lower=0.01)
+
+    K = df['strike']
+    T = df['T']
+    sigma = df['iv']
+
+    # d1
+    d1 = (np.log(S / K) + (0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+
+    # Gamma
+    gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
+
+    # GEX
+    df['gex'] = gamma * df['open_interest'] * (S**2)
+
+    # Convenção dealer
+    df.loc[df['tipo'] == 'P', 'gex'] *= -1
+
+    return df
+
+# =========================================
+# 4. UI
+# =========================================
 st.sidebar.header("🕹️ Real-Time Engine")
 moeda = st.sidebar.selectbox("Ativo", ["BTC", "ETH"])
-modo_visao = st.sidebar.selectbox("Métrica Principal", ["Net GEX", "Net DEX", "Net OI"])
-opacidade_abs = st.sidebar.slider("Opacidade Amarela (Abs)", 0.0, 1.0, 0.15)
+opacidade_abs = st.sidebar.slider("Opacidade Abs GEX", 0.0, 1.0, 0.15)
 
 df_raw = carregar_deribit(moeda)
 
+# =========================================
+# 5. PROCESSAMENTO
+# =========================================
 if df_raw is not None and not df_raw.empty:
+
     preco_spot = df_raw['estimated_delivery_price'].iloc[0]
+
     hoje_utc = datetime.now(timezone.utc).strftime("%d%b%y").upper()
     exp_list = sorted(df_raw['data_exp'].unique())
-    
-    selecao_exp = st.sidebar.multiselect("Vencimentos", options=exp_list, 
-                                       default=[hoje_utc] if hoje_utc in exp_list else [exp_list[0]])
+
+    selecao_exp = st.sidebar.multiselect(
+        "Vencimentos",
+        options=exp_list,
+        default=[hoje_utc] if hoje_utc in exp_list else [exp_list[0]]
+    )
 
     if selecao_exp:
         df = df_raw[df_raw['data_exp'].isin(selecao_exp)].copy()
-        
-        # Cálculos de Exposição (M$)
-        df['c_val'] = df.apply(lambda x: (x['open_interest'] * x['strike']) / 1e6 if x['tipo'] == 'C' else 0, axis=1)
-        df['p_val'] = df.apply(lambda x: (x['open_interest'] * x['strike']) / 1e6 if x['tipo'] == 'P' else 0, axis=1)
-        
-        res = df.groupby('strike').agg({'c_val': 'sum', 'p_val': 'sum', 'open_interest': 'sum'}).reset_index()
-        
-        # Garantia de colunas para evitar KeyError
-        res['Net GEX'] = res['c_val'] - res['p_val']
-        res['Net DEX'] = res['Net GEX'] * 1.15
+
+        # === GEX REAL ===
+        df = calcular_gex_real(df, preco_spot)
+
+        # === AGREGAÇÃO ===
+        res = df.groupby('strike').agg({
+            'gex': 'sum',
+            'open_interest': 'sum'
+        }).reset_index()
+
+        res = res.sort_values('strike')
+
+        # === MÉTRICAS ===
+        res['Net GEX'] = res['gex'] / 1e9
+        res['abs_gex'] = res['Net GEX'].abs()
         res['Net OI'] = (res['open_interest'] * res['strike']) / 1e6
-        res['abs_gex'] = res['c_val'] + res['p_val']
-        
-        # Níveis de Mercado
-        c_sort = res.sort_values('c_val', ascending=False)['strike'].tolist()
-        p_sort = res.sort_values('p_val', ascending=False)['strike'].tolist()
-        oi_sort = res.sort_values('open_interest', ascending=False)['strike'].tolist()
-        g_flip = res.iloc[(res['Net GEX']).abs().argsort()[:1]]['strike'].values[0]
 
-        # --- GRÁFICO 1: GEX MASTER ENGINE ---
+        # === G-FLIP ===
+        sign_change = np.where(np.sign(res['Net GEX']).diff() != 0)[0]
+        g_flip = res.iloc[sign_change[0]]['strike'] if len(sign_change) > 0 else None
+
+        # === FLOW ===
+        res['flow'] = res['Net GEX'].cumsum()
+
+        # =========================================
+        # 6. GRÁFICO GEX
+        # =========================================
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=res['strike'], y=res['abs_gex'], fill='tozeroy', mode='none',
-                                 fillcolor=f'rgba(255, 255, 0, {opacidade_abs})', name='Abs GEX'))
-        
-        cores = ['#00ffbb' if v > 0 else '#ff4444' for v in res[modo_visao]]
-        fig.add_trace(go.Bar(x=res['strike'], y=res[modo_visao], marker_color=cores, width=300, name=modo_visao))
 
-        fig.update_layout(template="plotly_dark", height=500, margin=dict(t=30, b=10),
-                          xaxis=dict(range=[preco_spot*0.88, preco_spot*1.12], dtick=500))
-        
-        fig.add_vline(x=preco_spot, line_color="orange", annotation_text=f"SPOT: {preco_spot:.0f}")
-        fig.add_vline(x=g_flip, line_color="white", line_dash="dot", annotation_text="G-FLIP")
+        fig.add_trace(go.Scatter(
+            x=res['strike'],
+            y=res['abs_gex'],
+            fill='tozeroy',
+            mode='none',
+            fillcolor=f'rgba(255,255,0,{opacidade_abs})',
+            name='Abs GEX'
+        ))
+
+        cores = ['#00ffbb' if v > 0 else '#ff4444' for v in res['Net GEX']]
+
+        fig.add_trace(go.Bar(
+            x=res['strike'],
+            y=res['Net GEX'],
+            marker_color=cores,
+            width=300,
+            name='Net GEX'
+        ))
+
+        fig.add_vline(x=preco_spot, line_color="orange",
+                      annotation_text=f"SPOT {preco_spot:.0f}")
+
+        if g_flip:
+            fig.add_vline(x=g_flip, line_color="white",
+                          line_dash="dot", annotation_text="G-FLIP")
+
+        fig.update_layout(
+            template="plotly_dark",
+            height=500,
+            margin=dict(t=30, b=10),
+            xaxis=dict(range=[preco_spot * 0.88, preco_spot * 1.12])
+        )
+
         st.plotly_chart(fig, use_container_width=True)
 
-        # --- GRÁFICO 2: DEALER HEDGE FLOW (HIRO STYLE) ---
-        # Reflete a pressão de proteção em tempo real
-        st.subheader("🌊 Dealer Hedge Flow (HIRO Intensity)")
-        fig_h = go.Figure()
-        
-        # Linha de Intensidade (Fluxo Delta Líquido)
-        fig_h.add_trace(go.Scatter(
-            x=res['strike'], 
-            y=res['Net GEX'].cumsum(), # Acumulado para mostrar pressão de direção
-            name="Net Hedge Flow",
-            line=dict(color='#00d4ff', width=3, shape='spline'),
-            fill='tozeroy',
-            fillcolor='rgba(0, 212, 255, 0.05)'
-        ))
-        
-        # Pressão de Call vs Put individual
-        fig_h.add_trace(go.Scatter(x=res['strike'], y=res['c_val'] * 0.05, name="Call Buy Pressure", line=dict(color='#00ffbb', width=1, dash='dot')))
-        fig_h.add_trace(go.Scatter(x=res['strike'], y=res['p_val'] * -0.05, name="Put Sell Pressure", line=dict(color='#ff4444', width=1, dash='dot')))
+        # =========================================
+        # 7. DEALER FLOW
+        # =========================================
+        st.subheader("🌊 Dealer Hedge Flow")
 
-        fig_h.update_layout(template="plotly_dark", height=250, margin=dict(t=10, b=10),
-                            xaxis=dict(range=[preco_spot*0.9, preco_spot*1.1]))
+        fig_h = go.Figure()
+
+        fig_h.add_trace(go.Scatter(
+            x=res['strike'],
+            y=res['flow'],
+            name="Net Hedge Flow",
+            line=dict(color='#00d4ff', width=3),
+            fill='tozeroy',
+            fillcolor='rgba(0,212,255,0.05)'
+        ))
+
+        fig_h.update_layout(
+            template="plotly_dark",
+            height=250,
+            margin=dict(t=10, b=10),
+            xaxis=dict(range=[preco_spot * 0.9, preco_spot * 1.1])
+        )
+
         st.plotly_chart(fig_h, use_container_width=True)
 
-        # --- STRING DE CÓPIA TRADINGVIEW ---
+        # =========================================
+        # 8. INFO
+        # =========================================
         st.divider()
-        max_pain = res.iloc[(res['c_val'] + res['p_val']).argmin()]['strike']
-        compresso = (preco_spot + g_flip) / 2
-        
-        tv_string = (
-            f"OI+,{oi_sort[0]},Vol95+,{preco_spot*1.05:.1f},2CallWall,{c_sort[1]},"
-            f"CallWall/VOL+,{c_sort[0]},Vol50+,{preco_spot*1.02:.1f},MaxPain/ExpPain,{max_pain},"
-            f"GammaFlip,{g_flip},PutWall,{p_sort[0]},2PutWall,{p_sort[1]},"
-            f"OI-/Tail,{oi_sort[-1]},Compressão,{compresso:.2f}"
+
+        st.caption(
+            f"Dealer Gamma Engine | Atualizado {datetime.now().strftime('%H:%M:%S')} UTC"
         )
-        st.code(tv_string, language="text")
-        st.caption(f"Dealer Engine Ativo | Sincronizado às {datetime.now().strftime('%H:%M:%S')} UTC")
 
 else:
-    st.info("Sincronizando com os terminais da Deribit...")
+    st.info("Sincronizando com Deribit...")
