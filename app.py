@@ -26,6 +26,10 @@ def load_data(ticker):
     try:
         url = f"https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency={ticker}&kind=option"
         res = requests.get(url).json().get("result", [])
+
+        if not res:
+            return None
+
         df = pd.DataFrame(res)
 
         parts = df['instrument_name'].str.split('-')
@@ -34,14 +38,16 @@ def load_data(ticker):
         df['tipo'] = parts.str[3]
 
         df = df.dropna(subset=['strike'])
+
         df['open_interest'] = pd.to_numeric(df['open_interest'], errors='coerce').fillna(0)
 
         return df
+
     except:
         return None
 
 # =========================================
-# EXPOSURE
+# EXPOSURE ENGINE
 # =========================================
 def calc_exposure(df, S):
     df = df.copy()
@@ -59,8 +65,12 @@ def calc_exposure(df, S):
     sigma = df['iv']
     T = df['T']
 
-    d1 = (np.log(S/K) + 0.5*sigma**2*T)/(sigma*np.sqrt(T))
-    d2 = d1 - sigma*np.sqrt(T)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        d1 = (np.log(S/K) + 0.5*sigma**2*T)/(sigma*np.sqrt(T))
+        d2 = d1 - sigma*np.sqrt(T)
+
+    d1 = d1.replace([np.inf, -np.inf], 0).fillna(0)
+    d2 = d2.replace([np.inf, -np.inf], 0).fillna(0)
 
     pdf = normal_pdf(d1)
 
@@ -74,7 +84,9 @@ def calc_exposure(df, S):
 
     df.loc[df['tipo']=='P', ['gex','vex','charm']] *= -1
 
-    return df.fillna(0)
+    df[['gex','vex','charm']] = df[['gex','vex','charm']].replace([np.inf, -np.inf], 0).fillna(0)
+
+    return df
 
 # =========================================
 # PROFILE
@@ -111,7 +123,7 @@ def get_signal(score):
     return "NEUTRO"
 
 # =========================================
-# INICIALIZA HISTÓRICO
+# ESTADO INICIAL
 # =========================================
 if "trades" not in st.session_state:
     st.session_state["trades"] = []
@@ -122,7 +134,7 @@ if "position" not in st.session_state:
 # =========================================
 # UI
 # =========================================
-st.sidebar.header("Config")
+st.sidebar.header("Configuração")
 ticker = st.sidebar.selectbox("Ativo", ["BTC","ETH"])
 auto = st.sidebar.toggle("Auto Trade (Simulado)")
 
@@ -150,12 +162,17 @@ if df_raw is not None and not df_raw.empty:
     score = calc_score(res, profile, spot_range)
     signal = get_signal(score)
 
-    st.title("📊 GEX Engine com Histórico")
+    # =========================================
+    # DASHBOARD
+    # =========================================
+    st.title("📊 GEX Engine (Simulação Profissional)")
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Score", round(score,1))
     col2.metric("Sinal", signal)
     col3.metric("Preço", round(spot,2))
+
+    st.info("⚠️ Modo simulação ativo")
 
     # =========================================
     # EXECUÇÃO SIMULADA
@@ -164,7 +181,7 @@ if df_raw is not None and not df_raw.empty:
 
         pos = st.session_state["position"]
 
-        # abre posição
+        # ABRIR POSIÇÃO
         if pos is None and signal in ["LONG","SHORT"]:
             trade = {
                 "tipo": signal,
@@ -174,9 +191,11 @@ if df_raw is not None and not df_raw.empty:
             st.session_state["position"] = trade
             st.session_state["trades"].append(trade)
 
-        # fecha posição
+        # FECHAR POSIÇÃO
         elif pos is not None and signal != pos["tipo"] and signal != "NEUTRO":
+
             pnl = (spot - pos["entrada"]) if pos["tipo"]=="LONG" else (pos["entrada"] - spot)
+
             pos["saida"] = spot
             pos["pnl"] = pnl
             pos["hora_saida"] = datetime.now().strftime("%H:%M:%S")
@@ -184,16 +203,35 @@ if df_raw is not None and not df_raw.empty:
             st.session_state["position"] = None
 
     # =========================================
-    # MOSTRAR HISTÓRICO
+    # HISTÓRICO
     # =========================================
     st.subheader("📜 Histórico de Trades")
 
     trades_df = pd.DataFrame(st.session_state["trades"])
+
     if not trades_df.empty:
+
+        # Blindagem total
+        if "pnl" not in trades_df.columns:
+            trades_df["pnl"] = 0.0
+        if "saida" not in trades_df.columns:
+            trades_df["saida"] = np.nan
+        if "hora_saida" not in trades_df.columns:
+            trades_df["hora_saida"] = ""
+
         st.dataframe(trades_df)
 
         total_pnl = trades_df["pnl"].fillna(0).sum()
         st.metric("PnL Total (simulado)", round(total_pnl,2))
+
+    # =========================================
+    # PNL EM ABERTO
+    # =========================================
+    pos = st.session_state.get("position")
+
+    if pos is not None:
+        pnl_aberto = (spot - pos["entrada"]) if pos["tipo"]=="LONG" else (pos["entrada"] - spot)
+        st.info(f"📈 PnL em aberto: {pnl_aberto:.2f}")
 
     # =========================================
     # GRÁFICOS
@@ -201,8 +239,14 @@ if df_raw is not None and not df_raw.empty:
     fig = go.Figure()
     fig.add_trace(go.Bar(x=res['strike'], y=res['Net GEX']))
     fig.add_vline(x=spot)
-    fig.update_layout(template="plotly_dark")
+    fig.update_layout(template="plotly_dark", height=300)
     st.plotly_chart(fig, use_container_width=True)
 
+    fig2 = go.Figure()
+    fig2.add_trace(go.Scatter(x=spot_range, y=profile))
+    fig2.add_vline(x=spot)
+    fig2.update_layout(template="plotly_dark", height=300)
+    st.plotly_chart(fig2, use_container_width=True)
+
 else:
-    st.info("Carregando...")
+    st.info("Carregando dados...")
