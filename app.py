@@ -5,12 +5,11 @@ import requests
 import plotly.graph_objects as go
 from streamlit_autorefresh import st_autorefresh
 from datetime import datetime, timezone
-import ccxt
 
 # =========================================
 # CONFIG
 # =========================================
-st.set_page_config(page_title="GEX Auto Trader", layout="wide")
+st.set_page_config(page_title="GEX Safe Trading Engine", layout="wide")
 st_autorefresh(interval=20000, key="refresh")
 
 # =========================================
@@ -115,44 +114,24 @@ def get_signal(score):
     return "NEUTRO"
 
 # =========================================
-# EXCHANGE
+# SIMULADOR DE TRADE
 # =========================================
-def conectar():
-    return ccxt.binance({
-        "apiKey": st.secrets["API_KEY"],
-        "secret": st.secrets["API_SECRET"],
-        "enableRateLimit": True
-    })
+def simular_trade(signal, price):
 
-# =========================================
-# TRADE EXECUTION
-# =========================================
-def executar_trade(signal, price):
+    if signal == "LONG":
+        return f"🟢 SIMULADO LONG @ {price:.2f}"
 
-    exchange = conectar()
-    symbol = "BTC/USDT"
-    size = 0.001
+    elif signal == "SHORT":
+        return f"🔴 SIMULADO SHORT @ {price:.2f}"
 
-    try:
-        if signal == "LONG":
-            order = exchange.create_market_buy_order(symbol, size)
-            return f"LONG executado @ {price}"
-
-        elif signal == "SHORT":
-            order = exchange.create_market_sell_order(symbol, size)
-            return f"SHORT executado @ {price}"
-
-        return "Sem trade"
-
-    except Exception as e:
-        return f"Erro: {str(e)}"
+    return "Sem trade"
 
 # =========================================
 # UI
 # =========================================
 st.sidebar.header("Configuração")
 ticker = st.sidebar.selectbox("Ativo", ["BTC","ETH"])
-auto_mode = st.sidebar.toggle("Auto Trade")
+auto_mode = st.sidebar.toggle("Auto Trade (Simulado)")
 
 df_raw = load_data(ticker)
 
@@ -186,12 +165,14 @@ if df_raw is not None and not df_raw.empty:
     # =========================================
     # DASHBOARD
     # =========================================
-    st.title("🤖 GEX Auto Trading Engine")
+    st.title("🧠 GEX Trading Engine (Modo Seguro)")
 
     col1, col2, col3 = st.columns(3)
     col1.metric("Score", round(score,1))
     col2.metric("Sinal", signal)
     col3.metric("Preço", round(spot,2))
+
+    st.info("⚠️ Modo simulação ativo (sem execução real de ordens)")
 
     # ALERTAS
     if score > 70:
@@ -208,7 +189,7 @@ if df_raw is not None and not df_raw.empty:
     if auto_mode and signal != "NEUTRO":
 
         if signal != st.session_state["last_signal"]:
-            result = executar_trade(signal, spot)
+            result = simular_trade(signal, spot)
             st.session_state["last_signal"] = signal
             st.success(result)
         else:
