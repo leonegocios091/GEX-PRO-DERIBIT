@@ -1,130 +1,119 @@
-import streamlit as st
 import pandas as pd
 import numpy as np
-import ccxt
-import plotly.graph_objects as go
-
-st.set_page_config(page_title="Backtest Engine", layout="wide")
-
-# =========================================
-# CARREGAR DADOS HISTÓRICOS
-# =========================================
-@st.cache_data
-def load_ohlc():
-    exchange = ccxt.binance()
-    ohlc = exchange.fetch_ohlcv("BTC/USDT", timeframe="1h", limit=500)
-
-    df = pd.DataFrame(ohlc, columns=["time","open","high","low","close","volume"])
-    df["time"] = pd.to_datetime(df["time"], unit="ms")
-
-    return df
+import requests
+from datetime import datetime, timezone
+import os
 
 # =========================================
-# GERADOR DE SINAL (PROXY)
+# CONFIG
 # =========================================
-def gerar_sinal(df):
-
-    # proxy simples usando momentum + volatilidade
-    df["ret"] = df["close"].pct_change()
-    df["vol"] = df["ret"].rolling(10).std()
-
-    df["score"] = (
-        np.tanh(df["ret"]*10)*40 +
-        np.tanh(df["vol"]*10)*20
-    ) + 50
-
-    def map_signal(s):
-        if s > 65:
-            return "LONG"
-        elif s < 35:
-            return "SHORT"
-        return "NEUTRO"
-
-    df["signal"] = df["score"].apply(map_signal)
-
-    return df
+TICKER = "BTC"
+FILE_NAME = "gex_history.csv"
 
 # =========================================
-# BACKTEST ENGINE
+# MATH
 # =========================================
-def backtest(df):
-
-    position = None
-    entry = 0
-    trades = []
-
-    equity = 0
-    equity_curve = []
-
-    for i in range(len(df)):
-
-        price = df["close"].iloc[i]
-        signal = df["signal"].iloc[i]
-
-        # abrir posição
-        if position is None and signal in ["LONG","SHORT"]:
-            position = signal
-            entry = price
-
-        # fechar posição
-        elif position is not None and signal != position and signal != "NEUTRO":
-
-            pnl = (price - entry) if position=="LONG" else (entry - price)
-
-            trades.append(pnl)
-
-            equity += pnl
-            position = None
-
-        equity_curve.append(equity)
-
-    return trades, equity_curve
+def normal_pdf(x):
+    return np.exp(-0.5 * x**2) / np.sqrt(2*np.pi)
 
 # =========================================
-# EXECUÇÃO
+# LOAD DERIBIT
 # =========================================
-df = load_ohlc()
-df = gerar_sinal(df)
+def load_deribit():
+    try:
+        url = f"https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency={TICKER}&kind=option"
+        res = requests.get(url).json().get("result", [])
+        df = pd.DataFrame(res)
 
-trades, equity_curve = backtest(df)
+        parts = df['instrument_name'].str.split('-')
+        df['strike'] = pd.to_numeric(parts.str[2], errors='coerce')
+        df['exp'] = parts.str[1]
+        df['tipo'] = parts.str[3]
+
+        df = df.dropna(subset=['strike'])
+
+        df['open_interest'] = pd.to_numeric(df['open_interest'], errors='coerce').fillna(0)
+
+        return df
+
+    except:
+        return None
 
 # =========================================
-# MÉTRICAS
+# CALC GEX
 # =========================================
-if trades:
+def calc_gex(df, S):
 
-    trades_arr = np.array(trades)
+    df = df.copy()
 
-    total_pnl = trades_arr.sum()
-    winrate = (trades_arr > 0).mean() * 100
-    avg_win = trades_arr[trades_arr>0].mean() if (trades_arr>0).any() else 0
-    avg_loss = trades_arr[trades_arr<=0].mean() if (trades_arr<=0).any() else 0
+    df['exp_datetime'] = pd.to_datetime(df['exp'], format='%d%b%y', errors='coerce', utc=True)
+    now = datetime.now(timezone.utc)
 
-    equity = pd.Series(equity_curve)
-    peak = equity.cummax()
-    drawdown = equity - peak
-    max_dd = drawdown.min()
+    df['T'] = (df['exp_datetime'] - now).dt.total_seconds() / (365*24*3600)
+    df['T'] = df['T'].clip(lower=1e-6)
 
-    # =========================================
-    # DASHBOARD
-    # =========================================
-    st.title("📊 Backtest Real (Proxy GEX)")
+    df['iv'] = pd.to_numeric(df['mark_iv'], errors='coerce')/100
+    df['iv'] = df['iv'].replace(0, np.nan).fillna(df['iv'].median()).clip(lower=0.01)
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("PnL Total", round(total_pnl,2))
-    col2.metric("Winrate", f"{winrate:.1f}%")
-    col3.metric("Média Gain", round(avg_win,2))
-    col4.metric("Média Loss", round(avg_loss,2))
+    K = df['strike']
+    sigma = df['iv']
+    T = df['T']
 
-    st.metric("Max Drawdown", round(max_dd,2))
+    d1 = (np.log(S/K) + 0.5*sigma**2*T)/(sigma*np.sqrt(T))
+    pdf = normal_pdf(d1)
 
-    # =========================================
-    # EQUITY CURVE
-    # =========================================
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(y=equity_curve, name="Equity"))
-    fig.update_layout(template="plotly_dark", height=400)
-    st.plotly_chart(fig, use_container_width=True)
+    gamma = pdf/(S*sigma*np.sqrt(T))
 
-else:
-    st.warning("Sem trades suficientes")
+    df['gex'] = gamma * df['open_interest'] * S**2
+
+    df.loc[df['tipo']=='P', 'gex'] *= -1
+
+    total_gex = df['gex'].sum() / 1e9
+
+    return total_gex
+
+# =========================================
+# SAVE DATA
+# =========================================
+def salvar_dado(timestamp, price, gex):
+
+    new_row = pd.DataFrame([{
+        "time": timestamp,
+        "price": price,
+        "gex": gex
+    }])
+
+    if os.path.exists(FILE_NAME):
+        old = pd.read_csv(FILE_NAME)
+        df = pd.concat([old, new_row], ignore_index=True)
+    else:
+        df = new_row
+
+    df.to_csv(FILE_NAME, index=False)
+
+# =========================================
+# MAIN
+# =========================================
+def run():
+
+    df = load_deribit()
+
+    if df is None or df.empty:
+        print("Erro ao carregar dados")
+        return
+
+    price = df['estimated_delivery_price'].iloc[0]
+
+    gex = calc_gex(df, price)
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    salvar_dado(now, price, gex)
+
+    print(f"[{now}] Price: {price:.2f} | GEX: {gex:.4f}")
+
+# =========================================
+# EXECUTE
+# =========================================
+if __name__ == "__main__":
+    run()
