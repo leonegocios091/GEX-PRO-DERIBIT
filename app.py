@@ -1,154 +1,82 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import requests
-import plotly.graph_objects as go
-from datetime import datetime, timezone
-import os
-
-st.set_page_config(layout="wide")
-
-FILE = "gex_surface.csv"
+st.subheader("🔥 GEX Heatmap (Pro)")
 
 # =========================
-# MATH
+# PREPARAÇÃO DOS DADOS
 # =========================
-def normal_pdf(x):
-    return np.exp(-0.5 * x**2) / np.sqrt(2*np.pi)
+pivot = hist.pivot_table(
+    index='strike',
+    columns='time',
+    values='gex',
+    aggfunc='sum'
+).fillna(0)
 
-# =========================
-# LOAD DATA
-# =========================
-@st.cache_data(ttl=15)
-def load_deribit():
-    try:
-        url = "https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC&kind=option"
-        res = requests.get(url).json().get("result", [])
-        df = pd.DataFrame(res)
-
-        parts = df['instrument_name'].str.split('-')
-        df['strike'] = pd.to_numeric(parts.str[2], errors='coerce')
-        df['tipo'] = parts.str[3]
-
-        df['open_interest'] = pd.to_numeric(df['open_interest'], errors='coerce').fillna(0)
-
-        return df.dropna(subset=['strike'])
-    except:
-        return None
+# ordena corretamente
+pivot = pivot.sort_index()
 
 # =========================
-# CALC GEX POR STRIKE
+# FILTRO DE REGIÃO (ZOOM)
 # =========================
-def calc_gex(df, S):
+spot = hist["price"].iloc[-1]
 
-    df = df.copy()
+range_min = spot * 0.9
+range_max = spot * 1.1
 
-    df['iv'] = pd.to_numeric(df['mark_iv'], errors='coerce')/100
-    df['iv'] = df['iv'].replace(0, np.nan).fillna(0.5)
-
-    K = df['strike']
-    sigma = df['iv']
-    T = 0.01
-
-    d1 = (np.log(S/K) + 0.5*sigma**2*T)/(sigma*np.sqrt(T))
-    pdf = normal_pdf(d1)
-
-    gamma = pdf/(S*sigma*np.sqrt(T))
-
-    df['gex'] = gamma * df['open_interest'] * S**2
-
-    df.loc[df['tipo']=="P", 'gex'] *= -1
-
-    return df[['strike','gex']]
+pivot = pivot[(pivot.index >= range_min) & (pivot.index <= range_max)]
 
 # =========================
-# SAVE SURFACE
+# SUAVIZAÇÃO (ANTI-RUÍDO)
 # =========================
-def save_surface(df, price):
-
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-    df['time'] = now
-    df['price'] = price
-
-    if os.path.exists(FILE):
-        old = pd.read_csv(FILE)
-        df = pd.concat([old, df], ignore_index=True)
-
-    df.to_csv(FILE, index=False)
+pivot_smooth = pivot.rolling(3, axis=0, min_periods=1).mean()
 
 # =========================
-# LOAD HISTORY
+# NORMALIZAÇÃO (CRUCIAL)
 # =========================
-def load_surface():
-    if os.path.exists(FILE):
-        df = pd.read_csv(FILE)
-        df['time'] = pd.to_datetime(df['time'])
-        return df
-    return pd.DataFrame()
+z = pivot_smooth.values
+
+max_abs = np.percentile(np.abs(z), 95)
+z = np.clip(z, -max_abs, max_abs)
 
 # =========================
-# UI
+# HEATMAP
 # =========================
-st.title("🔥 GEX HEATMAP INSTITUCIONAL")
+fig = go.Figure(data=go.Heatmap(
+    z=z,
+    x=pivot_smooth.columns,
+    y=pivot_smooth.index,
+    colorscale=[
+        [0.0, "#8B0000"],   # vermelho escuro
+        [0.5, "#111111"],   # neutro
+        [1.0, "#00FFFF"]    # azul/ciano
+    ],
+    zmid=0,
+    colorbar=dict(title="GEX"),
+))
 
-df_raw = load_deribit()
+# =========================
+# LINHA DE PREÇO
+# =========================
+fig.add_hline(
+    y=spot,
+    line_color="white",
+    line_width=2,
+    annotation_text="SPOT"
+)
 
-if df_raw is not None and not df_raw.empty:
+# =========================
+# LAYOUT
+# =========================
+fig.update_layout(
+    template="plotly_dark",
+    height=650,
+    margin=dict(t=40, b=40),
+    xaxis=dict(
+        title="Tempo",
+        tickangle=45
+    ),
+    yaxis=dict(
+        title="Strike",
+        autorange="reversed"  # opcional (estilo bookmap)
+    )
+)
 
-    price = df_raw['estimated_delivery_price'].iloc[0]
-
-    gex_df = calc_gex(df_raw, price)
-
-    # botão coleta
-    if st.button("📥 Coletar Snapshot"):
-        save_surface(gex_df, price)
-        st.success("Snapshot salvo")
-
-    # auto coleta
-    if st.checkbox("Auto coletar"):
-        save_surface(gex_df, price)
-
-    st.metric("Preço", round(price,2))
-
-    # =========================
-    # LOAD HISTÓRICO
-    # =========================
-    hist = load_surface()
-
-    if not hist.empty:
-
-        st.subheader("📊 Heatmap GEX")
-
-        # pivot para heatmap
-        pivot = hist.pivot_table(
-            index='strike',
-            columns='time',
-            values='gex',
-            aggfunc='sum'
-        )
-
-        pivot = pivot.fillna(0)
-
-        fig = go.Figure(data=go.Heatmap(
-            z=pivot.values,
-            x=pivot.columns,
-            y=pivot.index,
-            colorscale='RdBu',
-            zmid=0
-        ))
-
-        fig.update_layout(
-            template="plotly_dark",
-            height=600,
-            xaxis_title="Tempo",
-            yaxis_title="Strike"
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
-
-    else:
-        st.info("Sem histórico ainda. Clique em coletar.")
-
-else:
-    st.warning("Erro ao carregar dados")
+st.plotly_chart(fig, use_container_width=True)
